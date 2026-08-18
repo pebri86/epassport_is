@@ -1,0 +1,4 @@
+pyscard
+pycryptodome
+Pillow
+customtkinter

@@ -1,0 +1,37 @@
+# Python virtualenv
+.venv
+
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+
+# Compiled Java
+*.class
+
+# VS Code
+.vscode/
+*.vscode
+
+# Kilo
+.kilo/
+
+# JCardSim simulator runtime state (a real chip's EEPROM - never commit)
+PersistentMemory/
+eeprom.bin
+metadata.json
+
+# Runtime-generated keys/material
+test_data/cvca-ec-key.der
+test_data/csca
+
+# Card dumps captured from a reader session
+test_data/dump/
+
+# Logs
+*.log
+
+# OS / misc
+.DS_Store
+Thumbs.db
+.token
+.admin.token

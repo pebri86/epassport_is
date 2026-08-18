@@ -1,0 +1,58 @@
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number: 45 (0x2d)
+        Signature Algorithm: sha1WithRSAEncryption
+        Issuer: C=BE, O=UCL, CN=CSCA-HOUZARD
+        Validity
+            Not Before: Aug  6 09:29:42 2026 GMT
+            Not After : Aug  6 09:29:42 2027 GMT
+        Subject: C=BE, O=UCL, CN=Document_Signer_ROGER
+        Subject Public Key Info:
+            Public Key Algorithm: rsaEncryption
+                Public-Key: (1024 bit)
+                Modulus:
+                    00:c7:46:e5:81:61:cc:0b:35:12:7f:70:4c:ab:ee:
+                    4a:22:49:85:b3:bb:8b:28:48:a7:d4:02:95:11:73:
+                    6b:ef:fb:57:5c:fa:3b:77:5c:d2:49:af:27:56:2f:
+                    19:96:a8:fa:0e:50:78:bc:05:15:62:e8:6f:be:67:
+                    73:ce:11:9f:43:6e:a8:45:9d:be:da:b6:a0:43:01:
+                    a2:52:b5:45:32:6b:1a:ed:8e:1d:26:f3:0a:77:ff:
+                    98:f0:27:ce:b9:ba:ae:ea:2c:43:e8:23:c0:89:df:
+                    10:e1:34:30:39:ec:b1:81:11:2b:31:6b:17:ae:1f:
+                    b3:6b:04:13:6d:c6:99:9a:d3
+                Exponent: 65537 (0x10001)
+        X509v3 extensions:
+            X509v3 Basic Constraints: 
+                CA:FALSE
+            X509v3 Subject Key Identifier: 
+                A0:0C:43:39:51:1F:A8:86:5E:76:B0:9F:6A:66:11:D2:22:21:CB:F0
+            X509v3 Authority Key Identifier: 
+                95:6B:BD:79:8F:8F:F9:E0:A4:5E:B2:5F:F8:7C:1E:7C:43:5A:6B:41
+            X509v3 Key Usage: critical
+                Certificate Sign
+    Signature Algorithm: sha1WithRSAEncryption
+    Signature Value:
+        69:b8:32:a1:22:59:2c:6c:8b:a5:01:f4:0a:f1:20:1c:04:14:
+        81:c6:f0:86:73:22:ab:6d:09:ab:54:78:9c:af:16:60:93:3e:
+        ad:c2:a0:d2:6f:a5:eb:b1:ea:9d:44:95:08:08:9e:07:73:d1:
+        c1:cd:82:33:92:e0:c3:24:c2:4d:03:28:c4:77:29:ac:ee:7d:
+        c0:ed:93:be:5a:43:4c:90:c7:18:f5:f8:c8:96:18:12:3b:13:
+        cb:8e:00:d2:68:d6:75:42:bb:a4:ff:2c:76:96:a3:e1:65:72:
+        d4:26:7c:f4:ed:2a:15:f8:1d:e3:f9:08:f6:43:83:8c:6a:03:
+        5c:e8
+-----BEGIN CERTIFICATE-----
+MIICQDCCAamgAwIBAgIBLTANBgkqhkiG9w0BAQUFADAyMQswCQYDVQQGEwJCRTEM
+MAoGA1UECgwDVUNMMRUwEwYDVQQDDAxDU0NBLUhPVVpBUkQwHhcNMjYwODA2MDky
+OTQyWhcNMjcwODA2MDkyOTQyWjA7MQswCQYDVQQGEwJCRTEMMAoGA1UECgwDVUNM
+MR4wHAYDVQQDDBVEb2N1bWVudF9TaWduZXJfUk9HRVIwgZ8wDQYJKoZIhvcNAQEB
+BQADgY0AMIGJAoGBAMdG5YFhzAs1En9wTKvuSiJJhbO7iyhIp9QClRFza+/7V1z6
+O3dc0kmvJ1YvGZao+g5QeLwFFWLob75nc84Rn0NuqEWdvtq2oEMBolK1RTJrGu2O
+HSbzCnf/mPAnzrm6ruosQ+gjwInfEOE0MDnssYERKzFrF64fs2sEE23GmZrTAgMB
+AAGjXTBbMAkGA1UdEwQCMAAwHQYDVR0OBBYEFKAMQzlRH6iGXnawn2pmEdIiIcvw
+MB8GA1UdIwQYMBaAFJVrvXmPj/ngpF6yX/h8HnxDWmtBMA4GA1UdDwEB/wQEAwIC
+BDANBgkqhkiG9w0BAQUFAAOBgQBpuDKhIlksbIulAfQK8SAcBBSBxvCGcyKrbQmr
+VHicrxZgkz6twqDSb6XrseqdRJUICJ4Hc9HBzYIzkuDDJMJNAyjEdyms7n3A7ZO+
+WkNMkMcY9fjIlhgSOxPLjgDSaNZ1Qruk/yx2lqPhZXLUJnz07SoV+B3j+Qj2Q4OM
+agNc6A==
+-----END CERTIFICATE-----
