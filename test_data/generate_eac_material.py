@@ -15,12 +15,27 @@ The applet must be (re)personalized with the generated
 card's trust point (replace ``test_data/UTSTCVCA00001.selfsigned.cvcert`` and
 re-run personalization, or provision the CVCA public key + CAR directly).
 
+``--link`` additionally generates a CVCA link-certificate test kit, chained to
+the SAME CVCA1 key so it works against an already-personalized card:
+
+  * cvca2_ec_key.pem   - new CVCA (CVCA2) private key
+  * cvca_link.cvc      - link cert: CVCA1 signs CVCA2's public key
+                         (CAR=UTSTCVCA00001, CHR=UTSTCVCA00002, role CVCA)
+  * terminal2_ec_key.pem - terminal 2 private key
+  * terminal2.cvc      - terminal cert: CVCA2 signs terminal 2
+                         (CAR=UTSTCVCA00002, CHR=TERM0002, rights DG3+DG4)
+
+To test the link certificate, send the chain [cvca_link.cvc, terminal2.cvc]
+during Terminal Authentication (MSE Set DST with UTSTCVCA00001, PSO verify the
+link cert, PSO verify terminal2, MSE Set AT TERM0002).
+
 Usage:
-    .venv/bin/python test_data/generate_eac_material.py
+    .venv/bin/python test_data/generate_eac_material.py [--link]
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 
@@ -38,7 +53,9 @@ OID_ROLE_CVCA = bytes.fromhex("04007F00070202020201")  # id-RoleOfCVCA
 OID_ROLE_IS = bytes.fromhex("04007F00070202020203")  # id-RoleOfIS (terminal)
 
 CVCA_CAR = b"UTSTCVCA00001"
+CVCA2_CAR = b"UTSTCVCA00002"
 TERMINAL_CHR = b"TERM0001"
+TERMINAL2_CHR = b"TERM0002"
 DATE_EFF = bytes.fromhex("001A00010001")  # 2026-01-01
 DATE_EXP = bytes.fromhex("001E00010001")  # 2030-01-01
 RIGHTS = 0x03  # DG3 + DG4
@@ -105,26 +122,54 @@ def build_cvc(
     return body_tlv + _tlv(0x5F37, sig)
 
 
-def build_selfsigned_cvca(cvca_key) -> bytes:
+def build_selfsigned_cvca(cvca_key, car: bytes = CVCA_CAR) -> bytes:
     """Self-signed CVCA certificate (provisioned into the applet as trust point)."""
     point = (
         b"\x04"
         + cvca_key.pointQ.x.to_bytes(32, "big")
         + cvca_key.pointQ.y.to_bytes(32, "big")
     )
-    return build_cvc(cvca_key, CVCA_CAR, CVCA_CAR, OID_ROLE_CVCA, 0xFF, point)
+    return build_cvc(cvca_key, car, car, OID_ROLE_CVCA, 0xFF, point)
+
+
+def load_ec_key_pem(path: str):
+    """Load an EC private key from a PEM file, or None if it does not exist."""
+    try:
+        with open(path, "rb") as f:
+            return ECC.import_key(f.read())
+    except OSError:
+        return None
+
+
+def ec_point_bytes(key) -> bytes:
+    return (
+        b"\x04"
+        + key.pointQ.x.to_bytes(32, "big")
+        + key.pointQ.y.to_bytes(32, "big")
+    )
 
 
 def main() -> int:
     here = os.path.dirname(os.path.abspath(__file__))
 
-    cvca_key = ECC.generate(curve="P-256")
-    term_key = ECC.generate(curve="P-256")
-    term_point = (
-        b"\x04"
-        + term_key.pointQ.x.to_bytes(32, "big")
-        + term_key.pointQ.y.to_bytes(32, "big")
+    parser = argparse.ArgumentParser(
+        description="Generate EAC test material (CVCA + terminal certificate kit)."
     )
+    parser.add_argument(
+        "--link",
+        action="store_true",
+        help="also generate the CVCA link-certificate kit (CVCA2 + terminal 2)",
+    )
+    args = parser.parse_args()
+
+    # Reuse the existing CVCA1 key when present so the link certificate chains
+    # to the trust point already provisioned on the card.
+    cvca_key = load_ec_key_pem(os.path.join(here, "cvca_ec_key.pem"))
+    if cvca_key is None:
+        cvca_key = ECC.generate(curve="P-256")
+
+    term_key = ECC.generate(curve="P-256")
+    term_point = ec_point_bytes(term_key)
 
     cvca_cert = build_selfsigned_cvca(cvca_key)
     terminal_cvc = build_cvc(
@@ -137,6 +182,40 @@ def main() -> int:
         "terminal_ec_key.pem": term_key.export_key(format="PEM"),
         "terminal.cvc": terminal_cvc,
     }
+
+    link_note = []
+    if args.link:
+        cvca2_key = ECC.generate(curve="P-256")
+        term2_key = ECC.generate(curve="P-256")
+
+        # CVCA link certificate: CVCA1 (CAR=UTSTCVCA00001) certifies CVCA2's key.
+        # Issuer CAR stays the old reference, holder CHR is the new reference.
+        cvca_link = build_cvc(
+            cvca_key, CVCA_CAR, CVCA2_CAR, OID_ROLE_CVCA, 0xFF, ec_point_bytes(cvca2_key)
+        )
+        # Terminal 2 certificate: signed by CVCA2 (CAR=UTSTCVCA00002).
+        terminal2_cvc = build_cvc(
+            cvca2_key, CVCA2_CAR, TERMINAL2_CHR, OID_ROLE_IS, RIGHTS,
+            ec_point_bytes(term2_key),
+        )
+        files.update(
+            {
+                "cvca2_ec_key.pem": cvca2_key.export_key(format="PEM"),
+                "cvca_link.cvc": cvca_link,
+                "terminal2_ec_key.pem": term2_key.export_key(format="PEM"),
+                "terminal2.cvc": terminal2_cvc,
+            }
+        )
+        link_note = [
+            f"CVCA2 CAR  : {CVCA2_CAR.decode()}",
+            f"Terminal 2 : {TERMINAL2_CHR.decode()} (rights 0x{RIGHTS:02x})",
+            "",
+            "Chain for Terminal Authentication (GUI: select both .cvc files):",
+            f"  1. {os.path.join(here, 'cvca_link.cvc')}",
+            f"  2. {os.path.join(here, 'terminal2.cvc')}",
+            f"key = {os.path.join(here, 'terminal2_ec_key.pem')}",
+        ]
+
     for name, data in files.items():
         path = os.path.join(here, name)
         with open(path, "wb") as f:
@@ -146,6 +225,9 @@ def main() -> int:
     print(f"\nCVCA CAR   : {CVCA_CAR.decode()}")
     print(f"Terminal CHR: {TERMINAL_CHR.decode()}")
     print(f"Rights     : 0x{RIGHTS:02x} (DG3+DG4)")
+    if link_note:
+        print()
+        print("\n".join(link_note))
     print("\nTo use against the applet, (re)personalize it with:")
     print(f"  {os.path.join(here, 'cvca_selfsigned.cvcert')}")
     return 0

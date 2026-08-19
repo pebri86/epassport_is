@@ -13,7 +13,6 @@ Modules:
 * reader  - high-level PC/SC passport reader
 * dgs     - data group parsers (DG1 MRZ, images, DG11-13, EF.COM)
 * pa      - Passive Authentication (EF.SOD) verification
-* samples - load bundled sample data for offline demos
 """
 
 from .cvc import CardAccessInfo

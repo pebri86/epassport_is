@@ -66,6 +66,23 @@ def parse_cvc_refs(cvc: bytes) -> Tuple[Optional[bytes], Optional[bytes]]:
     return car, chr_
 
 
+def parse_cvc_chain_refs(
+    cert_chain: List[bytes],
+) -> Tuple[Optional[bytes], Optional[bytes]]:
+    """Extract ``(trust_car, terminal_chr)`` from a certificate chain.
+
+    ``trust_car`` is the Certification Authority Reference of the first
+    certificate (the CVCA link certificate's issuer CAR - the trust-point CAR
+    for MSE Set DST). ``terminal_chr`` is the Certificate Holder Reference of
+    the last certificate (the terminal key selected by MSE Set AT).
+    """
+    if not cert_chain:
+        return None, None
+    trust_car, _ = parse_cvc_refs(cert_chain[0])
+    _, terminal_chr = parse_cvc_refs(cert_chain[-1])
+    return trust_car, terminal_chr
+
+
 def _ecdsa_sign_sha256(ec_key, message: bytes) -> bytes:
     """ECDSA-SHA-256 signature in the plain ``R || S`` form (as the applet verifies)."""
     signer = DSS.new(ec_key, "fips-186-3", encoding="binary")
@@ -91,6 +108,8 @@ def do_terminal_authentication(
         cvca_car: the CVCA trust-point Certification Authority Reference (DO83
             value for MSE Set DST).
         cert_chain: the terminal certificate chain, one PSO-form CVC per entry.
+            A CVCA link certificate (role CVCA) may be the first entry, followed
+            by the terminal certificate(s).
         terminal_key: the terminal's EC private key (matches the certificate).
         terminal_chr: the terminal Certificate Holder Reference (DO83 value for
             MSE Set AT).

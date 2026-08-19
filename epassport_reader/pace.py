@@ -109,7 +109,8 @@ EC_P256 = ECDomainParams(
 )
 EC_P256_G = (EC_P256.gx, EC_P256.gy)
 
-# Brainpool P256r1 (RFC 5639) - parameterId 10. The PassportApplet PACE runs on this curve.
+# Brainpool P256r1 (RFC 5639) - parameterId 13 (ICAO Doc 9303-11 /
+# TR-03110: 0x0D = brainpoolP256r1, JMRTD PARAM_ID_ECP_BRAINPOOL_P256_R1).
 EC_BRAINPOOL_P256 = ECDomainParams(
     name="brainpoolP256r1",
     p=int("A9FB57DBA1EEA9BC3E660A909D838D726E3BF623D52620282013481D1F6E5377", 16),
@@ -119,7 +120,7 @@ EC_BRAINPOOL_P256 = ECDomainParams(
     gy=int("547EF835C3DAC4FD97F8461A14611DC9C27745132DED8E545C1D54C72F046997", 16),
     n=int("A9FB57DBA1EEA9BC3E660A909D838D718C397AA3B561A6F7901E0E82974856A7", 16),
     field_size=32,
-    param_id=10,
+    param_id=13,
 )
 EC_BRAINPOOL_P256_G = (EC_BRAINPOOL_P256.gx, EC_BRAINPOOL_P256.gy)
 
@@ -205,12 +206,13 @@ EC_P521 = ECDomainParams(
 )
 EC_P521_G = (EC_P521.gx, EC_P521.gy)
 
-# parameterId -> curve (ICAO Doc 9303 / TR-03110)
+# parameterId -> curve (ICAO Doc 9303-11 / TR-03110 standardized domain parameters:
+# 0x0C=prime256v1, 0x0D=brainpoolP256r1, 0x10=secp384r1, 0x11=secp521r1)
 PARAM_ID_TO_EC = {
-    10: EC_BRAINPOOL_P256,
-    12: EC_P256,
-    13: EC_P384,
-    14: EC_P521,
+    12: EC_P256,  # prime256v1 (NIST P-256)
+    13: EC_BRAINPOOL_P256,  # brainpoolP256r1
+    16: EC_P384,  # secp384r1 (NIST P-384)
+    17: EC_P521,  # secp521r1 (NIST P-521)
 }
 
 DEFAULT_EC = EC_P256

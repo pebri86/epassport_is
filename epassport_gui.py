@@ -13,9 +13,6 @@ result in tabs, mirroring the layout of the well-known JMRTD (jmrtd) GUI:
 * Security (SOD / Passive Authentication) - integrity + signature check
 * Log - the APDU / SM exchange
 
-A **Load sample data** action lets the GUI run offline against the bundled
-``test_data`` files when no card reader is available.
-
 The interface is built with **CustomTkinter** (modern, theme-aware widgets);
 ``ttk.Treeview`` tables and ``tk.Text`` panes are retained where CustomTkinter
 has no direct equivalent.
@@ -46,7 +43,6 @@ from epassport_reader.reader import PassportData
 from epassport_reader.cvc import CardAccessInfo
 from epassport_reader.pace import PARAM_ID_TO_EC, DEFAULT_EC
 from epassport_reader.pa import verify_pa
-from epassport_reader.samples import load_sample_data
 from epassport_reader.tlvs import (
     DATA_GROUP_TAGS,
     DATA_GROUP_TAG_TO_FID,
@@ -114,9 +110,6 @@ class EpassportGui:
     def _build_menu(self) -> None:
         menubar = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(
-            label="Load sample data (offline demo)", command=self.load_sample
-        )
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_close)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -187,16 +180,6 @@ class EpassportGui:
         ctk.CTkCheckBox(
             bar, text="Use CAN (PACE-CAN)", variable=self.use_can_var, font=ui_font
         ).pack(side="left", padx=(0, 12))
-
-        ctk.CTkButton(
-            bar,
-            text="Load sample data",
-            command=self.load_sample,
-            fg_color=("gray80", "gray25"),
-            text_color=("gray15", "white"),
-            border_width=1,
-            font=ui_font,
-        ).pack(side="right", padx=(4, 0))
 
         self.read_btn = ctk.CTkButton(
             bar,
@@ -484,7 +467,7 @@ class EpassportGui:
             self.read_btn.configure(state="normal")
         else:
             self.log_cb(
-                "No PC/SC readers found - use 'Load sample data' for an offline demo."
+                "No PC/SC readers found."
             )
             self.read_btn.configure(state="disabled")
 
@@ -738,11 +721,11 @@ class EpassportGui:
                 "Press 'Chip Auth (CA)' first.",
             )
             return
-        cvc_path = filedialog.askopenfilename(
-            title="Select terminal CVC (DER)",
+        cvc_paths = filedialog.askopenfilenames(
+            title="Select terminal CVC(s) (DER) - chain order: link cert first",
             filetypes=[("CVC", "*.cvc *.der *.bin"), ("All files", "*.*")],
         )
-        if not cvc_path:
+        if not cvc_paths:
             return
         key_path = filedialog.askopenfilename(
             title="Select terminal EC private key (PEM/DER)",
@@ -755,23 +738,25 @@ class EpassportGui:
         self._log("--- Starting Terminal Authentication (EAC TA) ---")
         threading.Thread(
             target=self._terminal_auth_worker,
-            args=(cvc_path, key_path),
+            args=(cvc_paths, key_path),
             daemon=True,
         ).start()
 
-    def _terminal_auth_worker(self, cvc_path: str, key_path: str) -> None:
+    def _terminal_auth_worker(self, cvc_paths, key_path: str) -> None:
         try:
             from Crypto.PublicKey import ECC, RSA
 
-            with open(cvc_path, "rb") as f:
-                terminal_cvc = f.read()
+            chain = []
+            for path in cvc_paths:
+                with open(path, "rb") as f:
+                    chain.append(f.read())
             with open(key_path, "rb") as f:
                 key_bytes = f.read()
             try:
                 terminal_key = ECC.import_key(key_bytes)
             except (ValueError, TypeError):
                 terminal_key = RSA.import_key(key_bytes)
-            self._reader.terminal_authentication(terminal_cvc, terminal_key)
+            self._reader.terminal_authentication(chain, terminal_key)
             self._ta_done = True
             self.root.after(
                 0,
@@ -1036,21 +1021,6 @@ class EpassportGui:
             messagebox.showerror("Recent MRZ", "Stored MRZ could not be parsed.")
 
     # ------------------------------------------------------------------
-    # sample data (offline demo)
-    # ------------------------------------------------------------------
-
-    def load_sample(self) -> None:
-        try:
-            pd = load_sample_data()
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Sample data", f"Could not load sample data: {exc}")
-            return
-        self._log("Loaded bundled sample data (test_data/*.bin) - offline demo.")
-        self._log("Note: the sample EF.SOD is a truncated dummy, so PA is unavailable.")
-        self._display(pd, sample=True)
-        self._set_status("Sample data loaded (offline).")
-
-    # ------------------------------------------------------------------
     # display
     # ------------------------------------------------------------------
 
@@ -1059,7 +1029,7 @@ class EpassportGui:
         for item in table.get_children():
             table.delete(item)
 
-    def _display(self, pd: PassportData, sample: bool = False) -> None:
+    def _display(self, pd: PassportData) -> None:
         self._last_pd = pd
 
         # --- MRZ / DG1 ------------------------------------------------
@@ -1211,9 +1181,29 @@ class EpassportGui:
                 "h",
             )
 
+        # --- EF.CVCA (app-DF): trust-point CAR list -----------------------
+        if pd.cvca_info:
+            cv = pd.cvca_info
+            self.sec_text.insert(
+                tk.END, f"\nEF.CVCA - {cv['raw_len']} bytes\n", "h"
+            )
+            if cv["cars"]:
+                for car_text in cv["cars_text"]:
+                    self.sec_text.insert(tk.END, f"  CAR: {car_text}\n")
+            else:
+                self.sec_text.insert(tk.END, "  (no CAR entries)\n")
+            self.sec_text.insert(
+                tk.END,
+                f"  raw: {pd.cvca_raw.hex(' ').upper()}\n",
+            )
+
         # --- EF.SOD / Passive Authentication -----------------------------
         if not pd.sod_info:
-            if not pd.card_security_info and not pd.card_security_raw:
+            if (
+                not pd.card_security_info
+                and not pd.card_security_raw
+                and not pd.cvca_info
+            ):
                 self.sec_text.insert(tk.END, "No security data read.\n")
             else:
                 self.sec_text.insert(tk.END, "\nEF.SOD was not read.\n")
@@ -1336,8 +1326,7 @@ class EpassportGui:
             "A Python GUI that reads ICAO Doc 9303 e-passports via PC/SC.\n"
             "ICAO standard flow: reads EF.CardAccess first to auto-detect\n"
             "supported protocols (PACE/BAC), then authenticates accordingly.\n"
-            "Manual protocol override (BAC, PACE) available in the toolbar.\n\n"
-            "Offline demo: File -> Load sample data.",
+            "Manual protocol override (BAC, PACE) available in the toolbar.",
         )
 
     def _debug_export_sod(self) -> None:

@@ -124,6 +124,7 @@ TAG_KEY_ID = 0x02
 # EF.CardSecurity custom public-key tags (applet-specific, non-standard).
 TAG_AA_PUBLIC_KEY = 0x5F2C
 TAG_CA_PUBLIC_KEY = 0x5F2D
+TAG_CAR = 0x42
 
 # subjectPublicKey is context [1] (0x81) by default; accept any tag whose value
 # is a 65-byte uncompressed point so slightly different tag assignments parse.
@@ -569,13 +570,12 @@ TAG_SET = 0x31
 PARAM_ID_TO_CURVE = {
     8: "P-192",
     9: "P-224",
-    10: "P-256 (brainpoolP256r1)",
-    11: "P-384 (brainpoolP384r1)",
     12: "P-256 (secp256r1 / NIST)",
-    13: "P-384 (secp384r1)",
-    14: "P-521 (secp521r1)",
-    15: "GF(2^m) 256",
-    16: "GF(2^m) 512",
+    13: "P-256 (brainpoolP256r1)",
+    14: "P-384 (brainpoolP384r1)",
+    15: "P-512 (brainpoolP512r1)",
+    16: "P-384 (secp384r1 / NIST)",
+    17: "P-521 (secp521r1 / NIST)",
 }
 
 
@@ -652,3 +652,30 @@ def parse_card_access(raw: bytes) -> CardAccessInfo:
     ecdh = [p for p in pace_infos if p["is_ecdh"]]
     best = ecdh[0] if ecdh else pace_infos[0]
     return CardAccessInfo(True, best, raw)
+
+
+def parse_ef_cvca(raw: bytes) -> Dict[str, object]:
+    """Parse EF.CVCA (app-DF, 0x011C): the trust-point CAR list.
+
+    ICAO Doc 9303-11 App. K, Table K-2: a fixed 36-byte transparent file
+    holding a sequence of CAR data objects (tag 0x42, most recent first),
+    zero-padded.  Returns the list of CARs and the decoded text form.
+    """
+    result: Dict[str, object] = {
+        "raw_len": len(raw),
+        "cars": [],
+        "cars_text": [],
+    }
+    i = 0
+    while i + 1 < len(raw):
+        tag = raw[i]
+        length = raw[i + 1]
+        if tag != TAG_CAR:
+            break
+        if i + 2 + length > len(raw):
+            break
+        car = raw[i + 2 : i + 2 + length]
+        result["cars"].append(car)  # type: ignore[attr-defined]
+        i += 2 + length
+    result["cars_text"] = [c.decode("latin-1", errors="replace") for c in result["cars"]]  # type: ignore[attr-defined]
+    return result

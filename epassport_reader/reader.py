@@ -27,6 +27,7 @@ from .cvc import (
     parse_card_access,
     parse_card_security,
     parse_chip_auth_data,
+    parse_ef_cvca,
 )
 from .pace import DEFAULT_EC, PARAM_ID_TO_EC, do_pace
 from .dgs import (
@@ -37,7 +38,7 @@ from .dgs import (
     parse_text_dg,
 )
 from .pa import parse_sod, verify_pa
-from .ta import do_terminal_authentication, parse_cvc_refs
+from .ta import do_terminal_authentication, parse_cvc_chain_refs
 from .tlvs import (
     DATA_GROUP_TAG_TO_FID,
     DATA_GROUP_TAG_TO_NUM,
@@ -94,6 +95,8 @@ class PassportData:
         self.pa_result: Optional[Dict] = None
         self.card_security_raw: Optional[bytes] = None
         self.card_security_info: Optional[Dict] = None
+        self.cvca_raw: Optional[bytes] = None
+        self.cvca_info: Optional[Dict] = None
         self.errors: List[str] = []
 
     def has(self, tag: int) -> bool:
@@ -282,20 +285,33 @@ class EPassportReader:
 
     def terminal_authentication(
         self,
-        terminal_cvc: bytes,
+        terminal_cvc,
         terminal_key,
     ) -> None:
         """Run EAC Terminal Authentication over the CA session.
 
-        ``terminal_cvc`` is the terminal's Card Verifiable Certificate (PSO
-        form, ``7F4E ... 5F37 ...``) and ``terminal_key`` the matching EC
-        private key. The CVCA trust-point CAR and the terminal CHR are taken
-        from the certificate; ``ID_IC`` is the IC's PACE ephemeral key
-        X-coordinate (PACE) or the MRZ document number (BAC).
+        ``terminal_cvc`` is either a single terminal certificate (PSO form,
+        ``7F4E ... 5F37 ...``) or a certificate chain of PSO-form CVCs. A chain
+        starts with the CVCA link certificate (CAR = the trust-point CAR, role
+        CVCA, certifying the new CVCA key) followed by the terminal certificate
+        signed by the new CVCA, so the applet updates its trust point before
+        importing the terminal key. ``terminal_key`` is the matching EC private
+        key of the LAST certificate in the chain. The CVCA trust-point CAR and
+        the terminal CHR are taken from the certificates; ``ID_IC`` is the IC's
+        PACE ephemeral key X-coordinate (PACE) or the MRZ document number (BAC).
         """
         if self.session is None or not getattr(self, "_ca_ifd_public", None):
             raise RuntimeError("chip_authentication() must run first")
         x_icc = self._ca_ifd_public[1:33]  # 32-byte X-coordinate of Q_IFD
+
+        chain = list(terminal_cvc) if isinstance(terminal_cvc, (list, tuple)) else [terminal_cvc]
+        if not chain:
+            raise RuntimeError("terminal certificate chain is empty")
+        cvca_car, terminal_chr = parse_cvc_chain_refs(chain)
+        if not cvca_car or not terminal_chr:
+            raise RuntimeError(
+                "terminal certificate chain is missing the issuer CAR or holder CHR"
+            )
 
         # ID_IC: IC's PACE ephemeral X under PACE, else the MRZ document number.
         if self.session.protocol == "PACE" and getattr(
@@ -310,14 +326,11 @@ class EPassportReader:
                 doc += str(check_digit(doc))
             id_ic = doc.encode("ascii")
 
-        cvca_car, terminal_chr = parse_cvc_refs(terminal_cvc)
-        if not cvca_car or not terminal_chr:
-            raise RuntimeError("terminal CVC is missing the issuer CAR or holder CHR")
         do_terminal_authentication(
             self.session,
             self.card.send,
             cvca_car,
-            [terminal_cvc],
+            chain,
             terminal_key,
             terminal_chr,
             id_ic,
@@ -812,6 +825,25 @@ class EPassportReader:
         except Exception as exc:  # noqa: BLE001
             pd.errors.append(f"EF.CardSecurity: {exc}")
             self.log(f"! EF.CardSecurity read failed: {exc}")
+
+        # EF.CVCA (app-DF, FID 0x011C): the trust-point CAR list maintained
+        # internally by the applet (ICAO Doc 9303-11 App. K). Collides with
+        # MF EF.CardAccess (also 0x011C), resolved by DF context - the current
+        # context is the app-DF after the CardSecurity read restored LDS1.
+        try:
+            cvca_raw = self.read_ef(self.CARD_ACCESS_FID)
+            pd.cvca_raw = cvca_raw
+            pd.cvca_info = parse_ef_cvca(cvca_raw)
+            self.log(
+                f"EF.CVCA: {len(cvca_raw)} bytes, CARs="
+                f"{pd.cvca_info['cars_text']}"
+            )
+        except FileNotFoundError:
+            pd.errors.append("EF.CVCA not found on card")
+            self.log("! EF.CVCA not found")
+        except Exception as exc:  # noqa: BLE001
+            pd.errors.append(f"EF.CVCA: {exc}")
+            self.log(f"! EF.CVCA read failed: {exc}")
 
         return pd
 
