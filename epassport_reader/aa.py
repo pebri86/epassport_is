@@ -11,9 +11,11 @@ Two key types are supported:
   block ``0x6A || m1(234) || SHA1(m1 || m2)(20) || 0xBC``. The terminal
   "encrypts" the signature with the DG15 public key to recover the block,
   checks the ``0x6A``/``0xBC`` frame and verifies ``SHA1(m1 || m2)``.
-* **ECDSA** (ECDSA-P256 AA, e.g. the applet): the chip signs the challenge
-  with ECDSA (Java Card ``ALG_ECDSA_SHA`` = SHA-1) and returns a plain
-  ``R || S`` signature. The terminal verifies it with the DG15 EC public key.
+* **ECDSA** (EC-AA, e.g. the applet on brainpoolP256r1): the chip signs the
+  challenge with ECDSA (Java Card ``ALG_ECDSA_SHA`` = SHA-1 or
+  ``ALG_ECDSA_SHA_256`` = SHA-256) and returns a **DER** ``SEQUENCE {
+  INTEGER r, INTEGER s }`` signature. The terminal recomputes the digest and
+  verifies it with the DG15 EC public key using the local curve arithmetic.
 """
 
 from __future__ import annotations
@@ -22,12 +24,19 @@ import hashlib
 import secrets
 from typing import Callable, NamedTuple, Optional, Tuple
 
-from Crypto.Hash import SHA1
-from Crypto.PublicKey import ECC, RSA
-from Crypto.PublicKey.ECC import _curves as _ECC_CURVES
+from Crypto.PublicKey import RSA
 
+from .pace import (
+    EC_BRAINPOOL_P256,
+    EC_P256,
+    EC_P384,
+    EC_P521,
+    _ec_decode_point,
+    _ec_point_add,
+    _ec_point_mul,
+)
 from .sm import SecureMessagingSession
-from .tlvs import read_der_tlv
+from .tlvs import parse_tlvs, read_der_tlv
 
 SendFn = Callable[[bytes], Tuple[bytes, int]]
 LogFn = Callable[[str], None]
@@ -35,6 +44,17 @@ LogFn = Callable[[str], None]
 INS_INTERNAL_AUTHENTICATE = 0x88
 RSA_MODULUS_LENGTH = 256  # RSA-2048 AA block
 CHALLENGE_LENGTH = 8
+
+# DER named-curve OIDs (content, no tag/length) -> domain parameters.  Covers
+# the NIST/brainpool P-256..P-521 set that ICAO AA and this applet use.  The
+# applet's AA key lives on brainpoolP256r1, which pycryptodome cannot import,
+# so verification is done with the local curve arithmetic.
+_NAMED_CURVE_OIDS = {
+    bytes.fromhex("2A8648CE3D030107"): EC_P256,  # prime256v1
+    bytes.fromhex("2B2403030208010107"): EC_BRAINPOOL_P256,  # brainpoolP256r1
+    bytes.fromhex("2B81040022"): EC_P384,  # secp384r1
+    bytes.fromhex("2B81040023"): EC_P521,  # secp521r1
+}
 
 
 class ActiveAuthResult(NamedTuple):
@@ -46,11 +66,40 @@ class ActiveAuthResult(NamedTuple):
     reason: Optional[str]
 
 
+def _parse_ec_spki(spki: bytes):
+    """Parse an EC SubjectPublicKeyInfo into ``(curve, point)`` or ``None``.
+
+    ``point`` is the 65-byte uncompressed public point.  The curve is
+    resolved from the AlgorithmIdentifier named-curve OID.
+    """
+    try:
+        tag, start, end = read_der_tlv(spki, 0)
+        if tag != 0x30:
+            return None
+        curve = None
+        point = None
+        for ctag, cvalue in parse_tlvs(spki[start:end]):
+            if ctag == 0x30:  # AlgorithmIdentifier
+                for atag, avalue in parse_tlvs(cvalue):
+                    if atag == 0x06 and avalue in _NAMED_CURVE_OIDS:
+                        curve = _NAMED_CURVE_OIDS[avalue]
+            elif ctag == 0x03 and len(cvalue) == 66 and cvalue[0] == 0x00 and cvalue[1] == 0x04:
+                point = cvalue[1:]  # BIT STRING: 00 <point>
+        if curve is None or point is None:
+            return None
+        _ec_decode_point(point, curve)  # validates curve membership
+        return curve, point
+    except (ValueError, IndexError):
+        return None
+
+
 def parse_dg15_aa_key(dg15: bytes) -> Tuple[str, object]:
     """Parse the EF.DG15 (tag 0x6F -> SPKI) Active-Authentication key.
 
-    Returns ``("RSA", key)`` or ``("EC", key)`` depending on the SPKI
-    algorithm. The EC key is a P-256 (or other NIST/brainpool) ECC key.
+    Returns ``("RSA", key)`` or ``("EC", (curve, point))`` depending on the
+    SPKI algorithm.  The EC public key is returned as ``(ECDomainParams,
+    65-byte point)`` so brainpoolP256r1 keys (which pycryptodome cannot
+    import) verify with the local curve arithmetic.
     """
     if not dg15 or dg15[0] != 0x6F:
         raise ValueError("DG15 does not start with LDS tag 0x6F")
@@ -58,14 +107,16 @@ def parse_dg15_aa_key(dg15: bytes) -> Tuple[str, object]:
     if tag != 0x6F or end != len(dg15):
         raise ValueError("Invalid DG15 outer structure")
     spki = dg15[start:end]
+    rsa = None
     try:
-        return "RSA", RSA.import_key(spki)  # DER SubjectPublicKeyInfo (RSA)
-    except ValueError:
-        pass
-    try:
-        return "EC", ECC.import_key(spki)  # DER SubjectPublicKeyInfo (EC)
+        rsa = RSA.import_key(spki)  # DER SubjectPublicKeyInfo (RSA)
     except (ValueError, TypeError):
         pass
+    if rsa is not None:
+        return "RSA", rsa
+    ec = _parse_ec_spki(spki)
+    if ec is not None:
+        return "EC", ec
     raise ValueError("DG15 key format not supported (neither RSA nor EC)")
 
 
@@ -110,37 +161,90 @@ def do_active_authentication(
     return _verify_rsa(key, challenge, signature)
 
 
-def _verify_ecdsa(key, challenge: bytes, signature: bytes) -> ActiveAuthResult:
-    """Verify an ECDSA-SHA (SHA-1) signature in plain ``R || S`` form.
+def _decode_sig(signature: bytes, size: int):
+    """Decode an ECDSA signature to ``(r, s)`` or ``None``.
 
-    Java Card signs with ``ALG_ECDSA_SHA`` (SHA-1) regardless of curve size, so
-    pycryptodome's ``DSS`` (which rejects SHA-1 for 256-bit keys) cannot be
-    used; verify the signature directly with the curve arithmetic instead.
+    Accepts the DER form Java Card returns (``SEQUENCE { INTEGER r,
+    INTEGER s }``) and the fixed ``R || S`` raw form some signers use.
     """
-    curve = _ECC_CURVES[key.pointQ.curve]
-    order = int(curve.order)
-    size = key.pointQ.size_in_bytes()
-    if len(signature) != 2 * size:
+    der = _decode_der_sig(signature)
+    if der is not None:
+        return der
+    if len(signature) == 2 * size:
+        r = int.from_bytes(signature[:size], "big")
+        s = int.from_bytes(signature[size:], "big")
+        return r, s
+    return None
+
+
+def _decode_der_sig(signature: bytes):
+    """Decode a DER-encoded ECDSA signature (Java Card ``ALG_ECDSA_SHA*``)."""
+    try:
+        tag, start, end = read_der_tlv(signature, 0)
+        if tag != 0x30 or end != len(signature):
+            return None
+        values = []
+        for t, v in parse_tlvs(signature[start:end]):
+            if t != 0x02:
+                return None
+            values.append(int.from_bytes(v, "big"))
+        if len(values) == 2:
+            return values[0], values[1]
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def _ecdsa_verify(curve, q: Tuple[int, int], r: int, s: int, e: int) -> bool:
+    """Raw ECDSA signature check over digest integer ``e``."""
+    order = curve.n
+    w = pow(s, -1, order)
+    u1 = (e * w) % order
+    u2 = (r * w) % order
+    g = (curve.gx, curve.gy)
+    pt = _ec_point_add(
+        _ec_point_mul(u1, g, curve),
+        _ec_point_mul(u2, q, curve),
+        curve,
+    )
+    if pt is None:
+        return False
+    return pt[0] % order == r
+
+
+def _verify_ecdsa(key, challenge: bytes, signature: bytes) -> ActiveAuthResult:
+    """Verify an ECDSA signature in DER or raw ``R || S`` form.
+
+    Java Card signs with either ``ALG_ECDSA_SHA`` (SHA-1) or
+    ``ALG_ECDSA_SHA_256`` (SHA-256); the hash is not signalled by the DG15
+    key alone, so both digests are tried.  ``key`` is ``(curve, point)`` as
+    returned by :func:`parse_dg15_aa_key`.
+    """
+    curve, point = key
+    q = _ec_decode_point(point, curve)
+    size = curve.field_size
+    rs = _decode_sig(signature, size)
+    if rs is None:
         return ActiveAuthResult(
             False,
             challenge,
             signature,
-            f"signature is {len(signature)} B, expected {2 * size} B (R||S)",
+            "malformed ECDSA signature (neither DER nor fixed R||S)",
         )
-    r = int.from_bytes(signature[:size], "big")
-    s = int.from_bytes(signature[size : 2 * size], "big")
+    r, s = rs
+    order = curve.n
     if not (1 <= r < order and 1 <= s < order):
         return ActiveAuthResult(False, challenge, signature, "ECDSA r/s out of range")
 
-    e = int.from_bytes(SHA1.new(challenge).digest(), "big")
-    w = pow(s, -1, order)
-    u1 = (e * w) % order
-    u2 = (r * w) % order
-    point = u1 * curve.G + u2 * key.pointQ
-    v = int(point.x) % order
-    ok = v == r
+    for digest in (
+        hashlib.sha256(challenge).digest(),
+        hashlib.sha1(challenge).digest(),
+    ):
+        e = int.from_bytes(digest, "big") % order
+        if _ecdsa_verify(curve, q, r, s, e):
+            return ActiveAuthResult(True, challenge, signature, None)
     return ActiveAuthResult(
-        ok, challenge, signature, None if ok else "ECDSA signature verification failed"
+        False, challenge, signature, "ECDSA signature verification failed"
     )
 
 

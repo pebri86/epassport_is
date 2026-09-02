@@ -43,8 +43,12 @@ MSE_CA_P1 = 0x41  # set for computation / CA selection
 MSE_CA_P2 = 0xA4  # authentication template
 GENERAL_AUTH_INS = 0x86
 
-# id-CA-ECDH-AES-CBC-CMAC-128 (ICAO Doc 9303-11 §6.2.4.2)
-CA_OID = bytes.fromhex("04007F00070202030202")
+# CA OIDs for key agreement (ICAO Doc 9303-11 §6.2.4.2)
+# These OIDs use the CA prefix 0302 (not PACE prefix 0402).
+# The terminal should use the OID from the chip's DG14 SecurityInfo.
+# CA OID suffix: 02=128-bit, 04=256-bit
+CA_OID_128 = bytes.fromhex("04007F00070202030202")  # id-CA-ECDH-AES-CBC-CMAC-128
+CA_OID_256 = bytes.fromhex("04007F00070202030204")  # id-CA-ECDH-AES-CBC-CMAC-256
 
 
 class ChipAuthResult(NamedTuple):
@@ -61,14 +65,20 @@ class ChipAuthResult(NamedTuple):
     ifd_scalar: int
 
 
-def derive_ca_keys(shared_secret: bytes) -> Tuple[bytes, bytes]:
+def derive_ca_keys(shared_secret: bytes, key_size: int = 128) -> Tuple[bytes, bytes]:
     """Derive ``(KEnc, KMac)`` from the ECDH shared-secret X-coordinate.
 
     AES-128 (ICAO Doc 9303-11 §9.7.1/§9.7.4): ``KSEnc = SHA1(Z || 0x00000001)``,
     ``KSMac = SHA1(Z || 0x00000002)``, truncated to 16 bytes (no DES parity).
+    AES-256: ``KSEnc = SHA256(Z || 0x00000001)[:32]``,
+    ``KSMac = SHA256(Z || 0x00000002)[:32]``.
     """
-    kenc = hashlib.sha1(shared_secret + b"\x00\x00\x00\x01").digest()[:16]
-    kmac = hashlib.sha1(shared_secret + b"\x00\x00\x00\x02").digest()[:16]
+    if key_size == 128:
+        kenc = hashlib.sha1(shared_secret + b"\x00\x00\x00\x01").digest()[:16]
+        kmac = hashlib.sha1(shared_secret + b"\x00\x00\x00\x02").digest()[:16]
+    else:
+        kenc = hashlib.sha256(shared_secret + b"\x00\x00\x00\x01").digest()[:32]
+        kmac = hashlib.sha256(shared_secret + b"\x00\x00\x00\x02").digest()[:32]
     return kenc, kmac
 
 
@@ -79,6 +89,7 @@ def _do_ca_exchange(
     key_ref: bytes,
     log: LogFn,
     curve: object = EC_P256,
+    ca_oid: bytes = CA_OID_128,
 ) -> ChipAuthResult:
     """Run the ICAO-standard CA exchange against an established SM ``session``."""
     # 1. generate the terminal's ephemeral key pair on the chip's curve
@@ -88,7 +99,7 @@ def _do_ca_exchange(
 
     # 2. MSE Set AT (0x41A4) selects the CA protocol, under SM
     ref = key_ref[:1] if key_ref else b"\x00"
-    data = b"\x80" + bytes([len(CA_OID)]) + CA_OID + b"\x84\x01" + ref
+    data = b"\x80" + bytes([len(ca_oid)]) + ca_oid + b"\x84\x01" + ref
     cmd = session.wrap_command(0x00, MSE_SET_AT_INS, MSE_CA_P1, MSE_CA_P2, data=data)
     log(f"CA MSE Set AT (0x41A4) -> {cmd.hex(' ').upper()}")
     resp, sw = send(cmd)
@@ -117,7 +128,12 @@ def _do_ca_exchange(
     z = shared_point[0].to_bytes(curve.field_size, "big")
 
     # 5. derive AES CA session keys and start a fresh PACE session (SSC = 0)
-    kenc, kmac = derive_ca_keys(z)
+    # Determine key size from CA OID suffix: 02=128-bit, 04=256-bit
+    if len(ca_oid) >= 1 and ca_oid[-1:] == b'\x04':
+        key_size = 256
+    else:
+        key_size = 128  # default (suffix 02 = 128-bit)
+    kenc, kmac = derive_ca_keys(z, key_size)
     log(f"CA KSEnc = {kenc.hex(' ').upper()}")
     log(f"CA KSMac = {kmac.hex(' ').upper()}")
     new_session = SecureMessagingSession("PACE", kenc, kmac, b"\x00" * 16)
@@ -135,6 +151,7 @@ def do_chip_authentication(
     key_ref: bytes = b"",
     log: Optional[LogFn] = None,
     curve: object = EC_P256,
+    ca_oid: bytes = CA_OID_128,
 ) -> ChipAuthResult:
     """Perform Chip Authentication over an established SM session.
 
@@ -144,7 +161,8 @@ def do_chip_authentication(
     for all subsequent commands. ``key_ref`` is the chip's CA key reference
     (from EF.DG14) used in the MSE key-reference tag; empty defaults to 0.
     ``curve`` must match the chip's CA public key domain (from EF.DG14).
+    ``ca_oid`` is the CA protocol OID from the chip's DG14; defaults to 128-bit.
     """
     if log is None:
         log = lambda _m: None
-    return _do_ca_exchange(session, send, chip_public_key, key_ref, log, curve)
+    return _do_ca_exchange(session, send, chip_public_key, key_ref, log, curve, ca_oid)

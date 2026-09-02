@@ -277,6 +277,7 @@ class EPassportReader:
             ca_data.public_key_ref,
             self.log,
             curve,
+            ca_data.protocol_oid,
         )
         self.session = result.session
         self._ca_ifd_public = result.ifd_public

@@ -108,6 +108,16 @@ _SECURITY_INFO_OIDS = {
     ): "Chip Authentication key agreement (id-CA-AES)",
     bytes.fromhex("04007F00070202020202"): "Chip Authentication mapping (id-PK-ECDH)",
     bytes.fromhex("04007F00070202040202"): "Chip Authentication mapping (id-CA-ECDH)",
+    bytes.fromhex("04007F00070202040204"): "Chip Authentication key agreement (id-CA-ECDH-AES-CBC-CMAC-192)",
+    bytes.fromhex("04007F00070202040206"): "Chip Authentication key agreement (id-CA-ECDH-AES-CBC-CMAC-256)",
+    bytes.fromhex("04007F00070202040404"): "Chip Authentication key agreement (id-CA-ECDH-IM-AES-CBC-CMAC-192)",
+    bytes.fromhex("04007F00070202040406"): "Chip Authentication key agreement (id-CA-ECDH-IM-AES-CBC-CMAC-256)",
+    # User DG14 OID (0x31 tag variant): maps to id-CA-ECDH-AES-CBC-CMAC-256
+    bytes.fromhex("04007F00070202030204"): "Chip Authentication key agreement (id-CA-ECDH-AES-CBC-CMAC-256)",
+    # Brainpool CA OIDs (added for broader support)
+    bytes.fromhex("04007F00070202040208"): "Chip Authentication key agreement (id-CA-ECDH-AES-CBC-CMAC-128-Brainpool)",
+    bytes.fromhex("04007F00070202040210"): "Chip Authentication key agreement (id-CA-ECDH-AES-CBC-CMAC-192-Brainpool)",
+    bytes.fromhex("04007F00070202040212"): "Chip Authentication key agreement (id-CA-ECDH-AES-CBC-CMAC-256-Brainpool)",
     **_PACE_OID_NAMES,
 }
 
@@ -130,6 +140,25 @@ TAG_CAR = 0x42
 # is a 65-byte uncompressed point so slightly different tag assignments parse.
 _POINT_CANDIDATE_TAGS = (0x81, 0x86)
 
+# EC named-curve OIDs (DER OID content, no tag/length) that a
+# ChipAuthenticationPublicKeyInfo AlgorithmIdentifier may carry instead of an
+# INTEGER standardized-domain-parameter id -> ICAO parameter id (curve).
+_NAMED_CURVE_OID_TO_PARAM_ID = {
+    bytes.fromhex("2A8648CE3D030107"): 12,  # prime256v1 (NIST P-256)
+    bytes.fromhex("2B2403030208010107"): 13,  # brainpoolP256r1
+    bytes.fromhex("2B81040022"): 16,  # secp384r1 (NIST P-384)
+    bytes.fromhex("2B81040023"): 17,  # secp521r1 (NIST P-521)
+}
+
+# ECDH Chip-Authentication key-agreement protocol OIDs (the id-CA-ECDH-AES-CBC-CMAC
+# family used to select the CA suite / AES key size in an MSE:Set AT).
+_CA_ECDH_AGREEMENT_OIDS = frozenset(
+    {
+        bytes.fromhex("04007F00070202030202"),  # id-CA-ECDH-AES-CBC-CMAC-128
+        bytes.fromhex("04007F00070202030204"),  # id-CA-ECDH-AES-CBC-CMAC-256
+    }
+)
+
 
 class ChipAuthData(NamedTuple):
     """Chip Authentication key material parsed from EF.DG14."""
@@ -137,19 +166,40 @@ class ChipAuthData(NamedTuple):
     chip_public_key: bytes  # 65-byte uncompressed EC point (04 || X || Y)
     public_key_ref: bytes  # keyId, used as the TA MSE DO83 reference
     parameter_id: Optional[int] = None  # standardized domain parameter id (curve)
+    protocol_oid: Optional[bytes] = None  # CA protocol OID from DG14
 
 
 def _is_point(value: bytes) -> bool:
     return len(value) == 65 and value[0] == 0x04
 
 
+def _named_curve_param_id(data: bytes) -> Optional[int]:
+    """Map the EC named-curve OID inside an AlgorithmIdentifier to a param id."""
+    if not data:
+        return None
+    try:
+        for tag, value in parse_tlvs(data):
+            if tag == TAG_OID:
+                pid = _NAMED_CURVE_OID_TO_PARAM_ID.get(value)
+                if pid is not None:
+                    return pid
+            if tag & 0x20:
+                pid = _named_curve_param_id(value)
+                if pid is not None:
+                    return pid
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
 def _extract_spki(spki_content: bytes) -> Tuple[Optional[bytes], Optional[int]]:
     """Extract ``(point, parameter_id)`` from an EC SubjectPublicKeyInfo.
 
-    Handles the SPKI layout used by EF.DG14:
-    ``SEQUENCE { AlgorithmIdentifier(SEQUENCE { OID, INTEGER paramId }), BIT STRING <point> }``.
-    Returns the 65-byte uncompressed point and the standardized domain parameter
-    id (curve reference), either of which may be absent.
+    Handles the SPKI layouts used by EF.DG14: ``SEQUENCE {
+    AlgorithmIdentifier(SEQUENCE { OID, INTEGER paramId | named-curve OID }),
+    BIT STRING <point> }``.  Returns the 65-byte uncompressed point and the
+    standardized domain parameter id (curve reference), either of which may
+    be absent.
     """
     point = None
     param_id = None
@@ -160,21 +210,28 @@ def _extract_spki(spki_content: bytes) -> Tuple[Optional[bytes], Optional[int]]:
                     v = int.from_bytes(avalue, "big")
                     if v:
                         param_id = v
+            if param_id is None:
+                param_id = _named_curve_param_id(value)
         elif tag == 0x03 and value and value[0] == 0x00 and _is_point(value[1:]):
             point = value[1:]  # BIT STRING: 00 <point>
     return point, param_id
 
 
-def _parse_security_info(body: bytes) -> Optional[ChipAuthData]:
-    """Parse one ``SecurityInfo`` sequence; return CA data if it is a chip key."""
+def _parse_security_info(body: bytes) -> Optional[Tuple[bytes, bytes, Optional[int], Optional[bytes]]]:
+    """Parse one ``SecurityInfo`` sequence; return CA data if it is a chip key.
+
+    Returns ``(point, key_id, parameter_id, protocol_oid)`` or ``None``.
+    """
     point = None
     key_id = None
     param_id = None
+    protocol_oid = None
     has_chip_auth_oid = False
 
     for tag, value in parse_tlvs(body):
         if tag == TAG_OID and value in (CHIP_AUTH_OID, CHIP_AUTH_PK_ECDH_OID):
             has_chip_auth_oid = True
+            protocol_oid = value
         elif tag in _POINT_CANDIDATE_TAGS and _is_point(value):
             point = value
         elif tag == TAG_KEY_ID and not key_id:
@@ -188,7 +245,25 @@ def _parse_security_info(body: bytes) -> Optional[ChipAuthData]:
 
     if not has_chip_auth_oid or point is None:
         return None
-    return ChipAuthData(point, key_id or b"", param_id)
+    return point, key_id or b"", param_id, protocol_oid
+
+
+def _ca_agreement_fields(body: bytes) -> Tuple[Optional[bytes], bytes]:
+    """Return the CA key-agreement OID and keyId of one SecurityInfo body."""
+    oid = None
+    key_id = b""
+    try:
+        for tag, value in parse_tlvs(body):
+            if tag == TAG_OID:
+                if value in _CA_ECDH_AGREEMENT_OIDS:
+                    oid = value
+            elif tag == TAG_KEY_ID:
+                # ChipAuthenticationInfo is (OID, version, keyId): the last
+                # INTEGER is the key reference used for keyId matching.
+                key_id = value
+    except (ValueError, IndexError):
+        pass
+    return oid, key_id
 
 
 def parse_chip_auth_data(raw: bytes) -> Optional[ChipAuthData]:
@@ -197,6 +272,11 @@ def parse_chip_auth_data(raw: bytes) -> Optional[ChipAuthData]:
     DG14 is ``6E <len> <SecurityInfos>`` where
     ``SecurityInfos ::= SEQUENCE OF SecurityInfo``, so the chip key is three
     SEQUENCE levels deep (``6E > SecurityInfos > SecurityInfo > fields``).
+
+    The protocol OID returned is the ECDH CA key-agreement OID (id-CA-ECDH-*)
+    that matches the chip key's keyId, which selects the CA suite / AES key
+    size for the MSE:Set AT and key derivation.
+
     Returns ``None`` when the file does not carry a chip CA public key.
     """
     if not raw:
@@ -211,19 +291,57 @@ def parse_chip_auth_data(raw: bytes) -> Optional[ChipAuthData]:
         except ValueError:
             pass
 
+    chip_data = None
+    chip_oid = None
+    agreements: List[Tuple[Optional[bytes], bytes]] = []
+    seen: set = set()
+
+    def note_body(body: bytes) -> None:
+        nonlocal chip_data, chip_oid
+        if body in seen:
+            return
+        seen.add(body)
+        data = _parse_security_info(body)
+        if data is not None and chip_data is None:
+            point, key_id, param_id, protocol_oid = data
+            chip_data = (point, key_id or b"", param_id)
+            chip_oid = protocol_oid
+        agg_oid, agg_key_id = _ca_agreement_fields(body)
+        if agg_oid is not None:
+            agreements.append((agg_oid, agg_key_id))
+
     for tag, value in parse_tlvs(raw):  # SecurityInfos
-        if tag != TAG_SEQUENCE:
+        if tag not in (TAG_SEQUENCE, TAG_SET):
             continue
         # the SecurityInfo may be one or two SEQUENCE levels deep
+        inner_tags = (TAG_SEQUENCE,)
+        if tag == TAG_SET:
+            inner_tags = (TAG_SEQUENCE, TAG_SET)
         for inner_tag, inner_value in parse_tlvs(value):
-            if inner_tag == TAG_SEQUENCE:
-                data = _parse_security_info(inner_value)
-                if data is not None:
-                    return data
-        data = _parse_security_info(value)
-        if data is not None:
-            return data
-    return None
+            if inner_tag in inner_tags:
+                note_body(inner_value)
+        note_body(value)
+
+    if chip_data is None:
+        return None
+
+    point, key_id, param_id = chip_data
+    protocol_oid = chip_oid
+    matched = False
+    for agg_oid, agg_key_id in agreements:
+        if key_id and agg_key_id == key_id:
+            protocol_oid = agg_oid
+            matched = True
+            break
+    if not matched and agreements:
+        best = agreements[0][0]
+        for agg_oid, _agg_key_id in agreements:
+            if agg_oid is not None and agg_oid.endswith(b"\x04"):
+                best = agg_oid
+                break
+        protocol_oid = best
+
+    return ChipAuthData(point, key_id, param_id, protocol_oid)
 
 
 def _extract_security_info(body: bytes) -> Dict[str, object]:
