@@ -43,12 +43,22 @@ MSE_CA_P1 = 0x41  # set for computation / CA selection
 MSE_CA_P2 = 0xA4  # authentication template
 GENERAL_AUTH_INS = 0x86
 
+<<<<<<< HEAD
 # CA OIDs for key agreement (ICAO Doc 9303-11 §6.2.4.2)
 # These OIDs use the CA prefix 0302 (not PACE prefix 0402).
 # The terminal should use the OID from the chip's DG14 SecurityInfo.
 # CA OID suffix: 02=128-bit, 04=256-bit
 CA_OID_128 = bytes.fromhex("04007F00070202030202")  # id-CA-ECDH-AES-CBC-CMAC-128
 CA_OID_256 = bytes.fromhex("04007F00070202030204")  # id-CA-ECDH-AES-CBC-CMAC-256
+=======
+# id-CA-ECDH-AES-CBC-CMAC-128 / -256 (ICAO Doc 9303-11 §6.2.4.2)
+CA_OID_CMAC_128 = bytes.fromhex("04007F00070202030202")
+CA_OID_CMAC_256 = bytes.fromhex("04007F00070202030204")
+
+
+def ca_mse_oid(key_bits: int) -> bytes:
+    return CA_OID_CMAC_256 if key_bits == 256 else CA_OID_CMAC_128
+>>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
 
 
 class ChipAuthResult(NamedTuple):
@@ -65,6 +75,7 @@ class ChipAuthResult(NamedTuple):
     ifd_scalar: int
 
 
+<<<<<<< HEAD
 def derive_ca_keys(shared_secret: bytes, key_size: int = 128) -> Tuple[bytes, bytes]:
     """Derive ``(KEnc, KMac)`` from the ECDH shared-secret X-coordinate.
 
@@ -79,6 +90,23 @@ def derive_ca_keys(shared_secret: bytes, key_size: int = 128) -> Tuple[bytes, by
     else:
         kenc = hashlib.sha256(shared_secret + b"\x00\x00\x00\x01").digest()[:32]
         kmac = hashlib.sha256(shared_secret + b"\x00\x00\x00\x02").digest()[:32]
+=======
+def derive_ca_keys(shared_secret: bytes, key_bits: int = 256) -> Tuple[bytes, bytes]:
+    """Derive ``(KEnc, KMac)`` from the ECDH shared-secret X-coordinate.
+
+    Matches the CA session-key derivation of the chip's ``id-CA-*`` OID:
+
+    * AES-256 (CMAC-256, this applet / EAC v2): ``KSEnc/KSMac =
+      SHA-256(Z || 0x0000000X)`` (32 bytes), per ICAO Doc 9303-11 §9.7.x.
+    * AES-128 (CMAC-128): ``SHA-1(Z || 0x0000000X)`` truncated to 16 bytes.
+    """
+    if key_bits == 256:
+        kenc = hashlib.sha256(shared_secret + b"\x00\x00\x00\x01").digest()
+        kmac = hashlib.sha256(shared_secret + b"\x00\x00\x00\x02").digest()
+    else:
+        kenc = hashlib.sha1(shared_secret + b"\x00\x00\x00\x01").digest()[:16]
+        kmac = hashlib.sha1(shared_secret + b"\x00\x00\x00\x02").digest()[:16]
+>>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
     return kenc, kmac
 
 
@@ -89,7 +117,11 @@ def _do_ca_exchange(
     key_ref: bytes,
     log: LogFn,
     curve: object = EC_P256,
+<<<<<<< HEAD
     ca_oid: bytes = CA_OID_128,
+=======
+    key_bits: int = 256,
+>>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
 ) -> ChipAuthResult:
     """Run the ICAO-standard CA exchange against an established SM ``session``."""
     # 1. generate the terminal's ephemeral key pair on the chip's curve
@@ -99,6 +131,10 @@ def _do_ca_exchange(
 
     # 2. MSE Set AT (0x41A4) selects the CA protocol, under SM
     ref = key_ref[:1] if key_ref else b"\x00"
+<<<<<<< HEAD
+=======
+    ca_oid = ca_mse_oid(key_bits)
+>>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
     data = b"\x80" + bytes([len(ca_oid)]) + ca_oid + b"\x84\x01" + ref
     cmd = session.wrap_command(0x00, MSE_SET_AT_INS, MSE_CA_P1, MSE_CA_P2, data=data)
     log(f"CA MSE Set AT (0x41A4) -> {cmd.hex(' ').upper()}")
@@ -128,6 +164,7 @@ def _do_ca_exchange(
     z = shared_point[0].to_bytes(curve.field_size, "big")
 
     # 5. derive AES CA session keys and start a fresh PACE session (SSC = 0)
+<<<<<<< HEAD
     # Determine key size from CA OID suffix: 02=128-bit, 04=256-bit
     if len(ca_oid) >= 1 and ca_oid[-1:] == b'\x04':
         key_size = 256
@@ -136,6 +173,11 @@ def _do_ca_exchange(
     kenc, kmac = derive_ca_keys(z, key_size)
     log(f"CA KSEnc = {kenc.hex(' ').upper()}")
     log(f"CA KSMac = {kmac.hex(' ').upper()}")
+=======
+    kenc, kmac = derive_ca_keys(z, key_bits)
+    log(f"CA KSEnc ({len(kenc) * 8}-bit) = {kenc.hex(' ').upper()}")
+    log(f"CA KSMac ({len(kmac) * 8}-bit) = {kmac.hex(' ').upper()}")
+>>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
     new_session = SecureMessagingSession("PACE", kenc, kmac, b"\x00" * 16)
     # Preserve the IC's PACE ephemeral X (ID_IC for Terminal Authentication);
     # CA re-keys the channel but ID_IC is bound to the PACE session.
@@ -151,7 +193,11 @@ def do_chip_authentication(
     key_ref: bytes = b"",
     log: Optional[LogFn] = None,
     curve: object = EC_P256,
+<<<<<<< HEAD
     ca_oid: bytes = CA_OID_128,
+=======
+    key_bits: int = 256,
+>>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
 ) -> ChipAuthResult:
     """Perform Chip Authentication over an established SM session.
 
@@ -161,8 +207,17 @@ def do_chip_authentication(
     for all subsequent commands. ``key_ref`` is the chip's CA key reference
     (from EF.DG14) used in the MSE key-reference tag; empty defaults to 0.
     ``curve`` must match the chip's CA public key domain (from EF.DG14).
+<<<<<<< HEAD
     ``ca_oid`` is the CA protocol OID from the chip's DG14; defaults to 128-bit.
     """
     if log is None:
         log = lambda _m: None
     return _do_ca_exchange(session, send, chip_public_key, key_ref, log, curve, ca_oid)
+=======
+    ``key_bits`` (128 or 256) is the CA AES session-key size advertised by the
+    chip's ``id-CA-ECDH-AES-CBC-CMAC-*`` OID in EF.DG14.
+    """
+    if log is None:
+        log = lambda _m: None
+    return _do_ca_exchange(session, send, chip_public_key, key_ref, log, curve, key_bits)
+>>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)

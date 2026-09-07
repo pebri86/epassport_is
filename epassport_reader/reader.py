@@ -270,6 +270,7 @@ class EPassportReader:
             if ca_data.parameter_id
             else DEFAULT_EC
         )
+        key_bits = ca_data.ca_key_bits or 256
         result = do_chip_authentication(
             self.session,
             self.card.send,
@@ -277,7 +278,11 @@ class EPassportReader:
             ca_data.public_key_ref,
             self.log,
             curve,
+<<<<<<< HEAD
             ca_data.protocol_oid,
+=======
+            key_bits,
+>>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
         )
         self.session = result.session
         self._ca_ifd_public = result.ifd_public

@@ -80,6 +80,134 @@ def _ec_encode_point(point, curve: ECDomainParams) -> bytes:
     )
 
 
+class ECPrivateKey:
+    """A terminal EC signing key (scalar + domain) for Terminal Authentication.
+
+    brainpoolP256r1 (the applet's TA curve) is not representable by
+    pycryptodome, so Terminal-Authentication signing runs on the pure-Python
+    curve arithmetic below (same domain the Chip-Authentication path uses).
+    """
+
+    __slots__ = ("d", "curve")
+
+    def __init__(self, d: int, curve: ECDomainParams):
+        self.d = d
+        self.curve = curve
+
+
+_OID_SECP256R1 = bytes.fromhex("2A8648CE3D030107")      # 1.2.840.10045.3.1.7
+_OID_BRAINPOOL_P256R1 = bytes.fromhex("2B2403030208010107")  # 1.3.36.3.3.2.8.1.1.7
+
+
+def _der_children(content: bytes):
+    """Parse a DER SEQUENCE value into a list of ``(tag, value)`` TLVs."""
+    out = []
+    i = 0
+    while i < len(content):
+        tag = content[i]
+        i += 1
+        if (tag & 0x1F) == 0x1F:
+            while True:
+                b = content[i]
+                i += 1
+                tag = (tag << 8) | b
+                if not (b & 0x80):
+                    break
+        length = content[i]
+        i += 1
+        if length & 0x80:
+            n = length & 0x7F
+            length = int.from_bytes(content[i:i + n], "big")
+            i += n
+        out.append((tag, content[i:i + length]))
+        i += length
+    return out
+
+
+def load_ec_private_key(data: bytes) -> ECPrivateKey:
+    """Load an EC private key from a PKCS#8 PEM/DER blob.
+
+    pycryptodome cannot import brainpool keys, so this parses the PKCS#8
+    ``ECPrivateKey`` directly (curve OID + scalar) and wraps it in an
+    :class:`ECPrivateKey`. Supports P-256 and brainpoolP256r1 (the applet's
+    Terminal-Authentication curve).
+    """
+    if b"-----" in data:
+        import base64
+
+        b64 = b"".join(
+            line for line in data.splitlines() if not line.startswith(b"-----")
+        )
+        data = base64.b64decode(b64)
+
+    top = _der_children(data)
+    if not top or top[0][0] != 0x30:
+        raise ValueError("not a PKCS#8 private key")
+    outer = top[0][1]
+    fields = _der_children(outer)
+    if len(fields) < 3 or fields[1][0] != 0x30 or fields[2][0] != 0x04:
+        raise ValueError("not an EC PKCS#8 private key")
+
+    alg_children = _der_children(fields[1][1])
+    oids = [v for t, v in alg_children if t == 0x06]
+    curve = None
+    if oids and oids[-1] == _OID_BRAINPOOL_P256R1:
+        curve = EC_BRAINPOOL_P256
+    elif oids and oids[-1] == _OID_SECP256R1:
+        curve = EC_P256
+    if curve is None:
+        raise ValueError("unsupported EC private key curve")
+
+    def _octet_values(content, acc):
+        for t, v in _der_children(content):
+            if t == 0x04:
+                acc.append(v)
+            elif t in (0x30,):
+                _octet_values(v, acc)
+        return acc
+
+    # The PKCS#8 private-key OCTET STRING wraps an ECPrivateKey SEQUENCE; the
+    # scalar is the innermost OCTET STRING whose value is in [1, n).
+    candidates = _octet_values(fields[2][1], [])
+    d = None
+    for v in candidates:
+        cand = int.from_bytes(v, "big")
+        if 1 <= cand < curve.n:
+            d = cand
+            break
+    if d is None:
+        raise ValueError("EC private key missing private scalar")
+    return ECPrivateKey(d, curve)
+
+
+def _ecdsa_sign_plain(d: int, curve: ECDomainParams, message: bytes) -> bytes:
+    """ECDSA-SHA-256 signing returning the plain fixed-size ``R || S`` form.
+
+    The applet's ``ECDSAPlainVerifier`` expects R and S as fixed
+    ``field_size``-byte big-endian integers (it reassembles them into DER), so
+    this mirrors that layout. Produces low-S signatures so the signature is
+    accepted regardless of Java Card canonical-signature enforcement.
+    """
+    n, fs = curve.n, curve.field_size
+    g = (curve.gx, curve.gy)
+    e = int.from_bytes(hashlib.sha256(message).digest(), "big")
+    half = n >> 1
+    while True:
+        k = int.from_bytes(secrets.token_bytes(fs), "big") % n
+        if k == 0:
+            continue
+        rp = _ec_point_mul(k, g, curve)
+        r = rp[0] % n
+        if r == 0:
+            continue
+        s = (pow(k, -1, n) * (e + r * d)) % n
+        if s == 0:
+            continue
+        if s > half:
+            s = n - s
+        return r.to_bytes(fs, "big") + s.to_bytes(fs, "big")
+
+
 def _ec_decode_point(data: bytes, curve: ECDomainParams) -> Tuple[int, int]:
     fs = curve.field_size
     expected = 1 + 2 * fs

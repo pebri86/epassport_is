@@ -23,9 +23,7 @@ from __future__ import annotations
 
 from typing import Callable, List, Optional, Tuple
 
-from Crypto.Hash import SHA256
-from Crypto.Signature import DSS
-
+from .pace import ECPrivateKey, _ecdsa_sign_plain
 from .sm import SecureMessagingSession
 from .tlvs import parse_tlvs
 
@@ -83,10 +81,14 @@ def parse_cvc_chain_refs(
     return trust_car, terminal_chr
 
 
-def _ecdsa_sign_sha256(ec_key, message: bytes) -> bytes:
-    """ECDSA-SHA-256 signature in the plain ``R || S`` form (as the applet verifies)."""
-    signer = DSS.new(ec_key, "fips-186-3", encoding="binary")
-    return signer.sign(SHA256.new(message))
+def _ecdsa_sign_sha256(ec_key: ECPrivateKey, message: bytes) -> bytes:
+    """ECDSA-SHA-256 signature in the plain ``R || S`` form (as the applet verifies).
+
+    ``ec_key`` is an :class:`epassport_reader.pace.ECPrivateKey` carrying the
+    terminal scalar and brainpoolP256r1 (or P-256) domain parameters, so this
+    runs on the pure-Python curve arithmetic (pycryptodome has no brainpool).
+    """
+    return _ecdsa_sign_plain(ec_key.d, ec_key.curve, message)
 
 
 def do_terminal_authentication(

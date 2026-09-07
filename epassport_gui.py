@@ -722,7 +722,7 @@ class EpassportGui:
             )
             return
         cvc_paths = filedialog.askopenfilenames(
-            title="Select terminal CVC(s) (DER) - chain order: link cert first",
+            title="Select terminal CVC(s) (DER) - chain order: DV then IS",
             filetypes=[("CVC", "*.cvc *.der *.bin"), ("All files", "*.*")],
         )
         if not cvc_paths:
@@ -744,7 +744,7 @@ class EpassportGui:
 
     def _terminal_auth_worker(self, cvc_paths, key_path: str) -> None:
         try:
-            from Crypto.PublicKey import ECC, RSA
+            from epassport_reader import pace
 
             chain = []
             for path in cvc_paths:
@@ -752,10 +752,7 @@ class EpassportGui:
                     chain.append(f.read())
             with open(key_path, "rb") as f:
                 key_bytes = f.read()
-            try:
-                terminal_key = ECC.import_key(key_bytes)
-            except (ValueError, TypeError):
-                terminal_key = RSA.import_key(key_bytes)
+            terminal_key = pace.load_ec_private_key(key_bytes)
             self._reader.terminal_authentication(chain, terminal_key)
             self._ta_done = True
             self.root.after(

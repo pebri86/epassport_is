@@ -7,7 +7,7 @@ public key is stored in **EF.DG14** (tag ``0x6E``, FID ``0x010E``) as a
 BAC) and parameters (password type, key length, domain parameters) the chip
 supports, so the terminal can auto-select the strongest available protocol.
 
-    SecurityInfos ::= SEQUENCE OF SecurityInfo
+    SecurityInfos ::= SET OF SecurityInfo
     SecurityInfo ::= SEQUENCE {
         protocol OBJECT IDENTIFIER,            -- id-PK-DH (Chip Authentication)
         subjectPublicKey [1] OCTET STRING,     -- 04||X||Y (65-byte point)
@@ -38,6 +38,11 @@ OID_STD_DOMAIN_PARAM = bytes.fromhex("04007F00070102")
 
 # id-CA (Chip Authentication, no key agreement) OID 0.4.0.127.0.7.2.2.4.2.2
 CHIP_AUTH_INFO_OID = bytes.fromhex("04007F00070202040202")
+
+# id-CA-ECDH-AES-CBC-CMAC-128 / -256 (ICAO Doc 9303-11) -> CA session key bits.
+CA_ECDH_CMAC_128 = bytes.fromhex("04007F00070202030202")
+CA_ECDH_CMAC_256 = bytes.fromhex("04007F00070202030204")
+_CA_OID_TO_BITS = {CA_ECDH_CMAC_128: 128, CA_ECDH_CMAC_256: 256}
 
 # ---------------------------------------------------------------------------
 # PACE protocol OIDs (ICAO Doc 9303 / BSI TR-03110)
@@ -166,7 +171,21 @@ class ChipAuthData(NamedTuple):
     chip_public_key: bytes  # 65-byte uncompressed EC point (04 || X || Y)
     public_key_ref: bytes  # keyId, used as the TA MSE DO83 reference
     parameter_id: Optional[int] = None  # standardized domain parameter id (curve)
+<<<<<<< HEAD
     protocol_oid: Optional[bytes] = None  # CA protocol OID from DG14
+=======
+    ca_key_bits: Optional[int] = None  # 128 or 256 (CA AES session key length)
+
+
+# Named-curve OIDs found in the CA SPKI AlgorithmIdentifier -> ICAO domain
+# parameter id (matches epassport_reader.pace.PARAM_ID_TO_EC).
+_NAMED_CURVE_OID_TO_PARAM = {
+    bytes.fromhex("2A8648CE3D030107"): 12,  # secp256r1 / prime256v1 (NIST P-256)
+    bytes.fromhex("2B2403030208010107"): 13,  # brainpoolP256r1
+    bytes.fromhex("2B81040022"): 16,  # secp384r1
+    bytes.fromhex("2B81040023"): 17,  # secp521r1
+}
+>>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
 
 
 def _is_point(value: bytes) -> bool:
@@ -195,11 +214,18 @@ def _named_curve_param_id(data: bytes) -> Optional[int]:
 def _extract_spki(spki_content: bytes) -> Tuple[Optional[bytes], Optional[int]]:
     """Extract ``(point, parameter_id)`` from an EC SubjectPublicKeyInfo.
 
+<<<<<<< HEAD
     Handles the SPKI layouts used by EF.DG14: ``SEQUENCE {
     AlgorithmIdentifier(SEQUENCE { OID, INTEGER paramId | named-curve OID }),
     BIT STRING <point> }``.  Returns the 65-byte uncompressed point and the
     standardized domain parameter id (curve reference), either of which may
     be absent.
+=======
+    Handles the SPKI layout used by EF.DG14:
+    ``SEQUENCE { AlgorithmIdentifier(SEQUENCE { OID, INTEGER paramId | OID namedCurve }), BIT STRING <point> }``.
+    Returns the 65-byte uncompressed point and the standardized domain parameter
+    id (curve reference), either of which may be absent.
+>>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
     """
     point = None
     param_id = None
@@ -210,8 +236,17 @@ def _extract_spki(spki_content: bytes) -> Tuple[Optional[bytes], Optional[int]]:
                     v = int.from_bytes(avalue, "big")
                     if v:
                         param_id = v
+<<<<<<< HEAD
             if param_id is None:
                 param_id = _named_curve_param_id(value)
+=======
+                elif (
+                    atag == TAG_OID
+                    and avalue in _NAMED_CURVE_OID_TO_PARAM
+                    and param_id is None
+                ):
+                    param_id = _NAMED_CURVE_OID_TO_PARAM[avalue]
+>>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
         elif tag == 0x03 and value and value[0] == 0x00 and _is_point(value[1:]):
             point = value[1:]  # BIT STRING: 00 <point>
     return point, param_id
@@ -266,10 +301,46 @@ def _ca_agreement_fields(body: bytes) -> Tuple[Optional[bytes], bytes]:
     return oid, key_id
 
 
+def _unwrap_security_infos(body: bytes) -> bytes:
+    """Unwrap one enclosing ``SET OF`` / ``SEQUENCE OF`` SecurityInfos node.
+
+    ICAO 9303-11 defines ``SecurityInfos ::= SET OF SecurityInfo``, so a DG14 /
+    CardSecurity blob is often a single SET (0x31) — or, in some encoders, a
+    SEQUENCE (0x30) — whose content is the list of SecurityInfo SEQUENCEs.
+    This returns the inner content when ``body`` is exactly such a wrapper,
+    otherwise ``body`` unchanged (already a flat SecurityInfo list).
+    """
+    try:
+        cand = list(parse_tlvs(body))
+    except Exception:
+        return body
+    if len(cand) == 1 and cand[0][0] in (TAG_SET, TAG_SEQUENCE):
+        try:
+            inner = list(parse_tlvs(cand[0][1]))
+        except Exception:
+            return body
+        if any(t == TAG_SEQUENCE for t, _ in inner):
+            return cand[0][1]
+    return body
+
+
+def _ca_key_bits_of(body: bytes) -> Optional[int]:
+    """Return the CA AES key size (128/256) advertised by one SecurityInfo body."""
+    for tag, value in parse_tlvs(body):
+        if tag == TAG_OID and value in _CA_OID_TO_BITS:
+            return _CA_OID_TO_BITS[value]
+        if tag == TAG_SEQUENCE:
+            for itag, ivalue in parse_tlvs(value):
+                if itag == TAG_OID and ivalue in _CA_OID_TO_BITS:
+                    return _CA_OID_TO_BITS[ivalue]
+    return None
+
+
 def parse_chip_auth_data(raw: bytes) -> Optional[ChipAuthData]:
     """Parse EF.DG14 into Chip-Authentication key material.
 
     DG14 is ``6E <len> <SecurityInfos>`` where
+<<<<<<< HEAD
     ``SecurityInfos ::= SEQUENCE OF SecurityInfo``, so the chip key is three
     SEQUENCE levels deep (``6E > SecurityInfos > SecurityInfo > fields``).
 
@@ -278,11 +349,17 @@ def parse_chip_auth_data(raw: bytes) -> Optional[ChipAuthData]:
     size for the MSE:Set AT and key derivation.
 
     Returns ``None`` when the file does not carry a chip CA public key.
+=======
+    ``SecurityInfos ::= SET OF SecurityInfo`` (some encoders use a flat
+    ``SEQUENCE OF``), so the chip key is found by unwrapping the SecurityInfos
+    node (``6E > SecurityInfos > SecurityInfo > fields``). Returns ``None`` when
+    the file does not carry a chip CA public key.
+>>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
     """
     if not raw:
         return None
 
-    # Strip the outer LDS tag 0x6E so the SecurityInfos SEQUENCE is at the top.
+    # Strip the outer LDS tag 0x6E so the SecurityInfos SET is at the top.
     if raw[0] == 0x6E:
         try:
             tag, start, end = read_der_tlv(raw, 0)
@@ -291,6 +368,7 @@ def parse_chip_auth_data(raw: bytes) -> Optional[ChipAuthData]:
         except ValueError:
             pass
 
+<<<<<<< HEAD
     chip_data = None
     chip_oid = None
     agreements: List[Tuple[Optional[bytes], bytes]] = []
@@ -312,12 +390,22 @@ def parse_chip_auth_data(raw: bytes) -> Optional[ChipAuthData]:
 
     for tag, value in parse_tlvs(raw):  # SecurityInfos
         if tag not in (TAG_SEQUENCE, TAG_SET):
+=======
+    raw = _unwrap_security_infos(raw)
+
+    key_data = None
+    ca_bits = None
+
+    for tag, value in parse_tlvs(raw):  # SecurityInfo SEQUENCEs
+        if tag != TAG_SEQUENCE:
+>>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
             continue
         # the SecurityInfo may be one or two SEQUENCE levels deep
         inner_tags = (TAG_SEQUENCE,)
         if tag == TAG_SET:
             inner_tags = (TAG_SEQUENCE, TAG_SET)
         for inner_tag, inner_value in parse_tlvs(value):
+<<<<<<< HEAD
             if inner_tag in inner_tags:
                 note_body(inner_value)
         note_body(value)
@@ -342,6 +430,28 @@ def parse_chip_auth_data(raw: bytes) -> Optional[ChipAuthData]:
         protocol_oid = best
 
     return ChipAuthData(point, key_id, param_id, protocol_oid)
+=======
+            if inner_tag == TAG_SEQUENCE:
+                if ca_bits is None:
+                    ca_bits = _ca_key_bits_of(inner_value)
+                if key_data is None:
+                    key_data = _parse_security_info(inner_value)
+        if ca_bits is None:
+            ca_bits = _ca_key_bits_of(value)
+        if key_data is None:
+            key_data = _parse_security_info(value)
+        if key_data is not None and ca_bits is not None:
+            break
+
+    if key_data is None:
+        return None
+    return ChipAuthData(
+        key_data.chip_public_key,
+        key_data.public_key_ref,
+        key_data.parameter_id,
+        ca_bits,
+    )
+>>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
 
 
 def _extract_security_info(body: bytes) -> Dict[str, object]:
