@@ -43,6 +43,7 @@ from epassport_reader.reader import PassportData
 from epassport_reader.cvc import CardAccessInfo
 from epassport_reader.pace import PARAM_ID_TO_EC, DEFAULT_EC
 from epassport_reader.pa import verify_pa
+from epassport_reader.trace import SessionTrace, write_report_json
 from epassport_reader.tlvs import (
     DATA_GROUP_TAGS,
     DATA_GROUP_TAG_TO_FID,
@@ -83,6 +84,7 @@ class EpassportGui:
         self._reader = None  # connected EPassportReader (for CA/TA)
         self._ca_done = False  # Chip Authentication performed in session
         self._ta_done = False  # Terminal Authentication performed
+        self._trace: Optional[SessionTrace] = None  # live session coverage trace
         self._readers: List[str] = []
         self._recent_mrz: Optional[str] = None
         self._recent_mrz_file = Path.home() / ".epassport_is_recent_mrz"
@@ -137,6 +139,10 @@ class EpassportGui:
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="About", command=self._about)
         help_menu.add_separator()
+        help_menu.add_command(
+            label="Export coverage report (JSON)",
+            command=self._export_coverage_report,
+        )
         help_menu.add_command(
             label="Debug: Export raw SOD", command=self._debug_export_sod
         )
@@ -503,6 +509,12 @@ class EpassportGui:
             reader_idx = self._readers.index(reader_name)
         except ValueError:
             reader_idx = 0
+        self._begin_trace(
+            protocol_requested=protocol_display,
+            reader=reader_name,
+            can=bool(can),
+            mrz=bool(doc and dob and expiry),
+        )
         self.read_btn.configure(state="disabled")
         self._set_status(f"Reading passport ({protocol_display}) ...")
         self._log(
@@ -529,16 +541,20 @@ class EpassportGui:
                 log=self.log_cb,
             )
             probe.connect(reader_idx)
+            self._trace_mark("connect", "ok")
 
             card_access = None
             if protocol in ("AUTO", "HYBRID"):
                 self.log_cb("Reading EF.CardAccess to detect supported protocols ...")
                 try:
                     card_access = probe.read_card_access()
+                    self._trace_mark("card_access", "ok")
                 except FileNotFoundError:
                     self.log_cb("! EF.CardAccess not found on card")
+                    self._trace_mark("card_access", "failed", detail="not found")
                 except Exception as exc:
                     self.log_cb(f"! CardAccess read failed: {exc}")
+                    self._trace_mark("card_access", "failed", detail=str(exc))
 
             # Determine the final protocol
             if protocol == "AUTO":
@@ -624,18 +640,34 @@ class EpassportGui:
                     f"(parameterId={param_id}, field={ec.field_size}B)"
                 )
 
+            self._trace_mark("authentication", "running", detail=f"protocol={final_protocol}")
             if final_protocol == "HYBRID":
                 reader.authenticate_hybrid()
             else:
                 reader.authenticate()
+            self._trace_mark("authentication", "ok", detail=f"protocol={final_protocol}")
+            if self._trace is not None:
+                self._trace.update_meta(
+                    session_protocol=final_protocol,
+                    pace_curve=getattr(reader.pace_curve, "name", None),
+                )
             self.root.after(0, lambda r=reader: self._keep_reader(r))
             pd = reader.read_all()
+            self._trace_mark("dg_read", "ok")
+            pa = getattr(pd, "pa_result", None)
+            if pa:
+                self._trace_mark(
+                    "passive_auth",
+                    "ok" if pa.get("overall") == "PASS" else "failed",
+                    detail=str(pa.get("overall", "?")),
+                )
             self.root.after(0, lambda: self._display(pd))
             self.root.after(
                 0,
                 lambda p=final_protocol: self._set_status(f"Read complete ({p})."),
             )
         except Exception as exc:
+            self._trace_fail_running(str(exc))
             self.log_cb(f"! ERROR: {exc}")
             self.root.after(0, lambda e=exc: self._set_status(f"Failed: {e}"))
         finally:
@@ -688,9 +720,11 @@ class EpassportGui:
         threading.Thread(target=self._chip_auth_worker, daemon=True).start()
 
     def _chip_auth_worker(self) -> None:
+        self._trace_mark("chip_auth", "running")
         try:
             self._reader.chip_authentication()
             self._ca_done = True
+            self._trace_mark("chip_auth", "ok")
             self.root.after(
                 0,
                 lambda: self._set_status(
@@ -699,6 +733,7 @@ class EpassportGui:
             )
             self.root.after(0, lambda: self._log("Chip Authentication OK."))
         except Exception as exc:  # noqa: BLE001
+            self._trace_mark("chip_auth", "failed", detail=str(exc))
             self.log_cb(f"! Chip Authentication failed: {exc}")
             self.root.after(
                 0, lambda e=exc: self._set_status(f"Chip Authentication failed: {e}")
@@ -743,6 +778,7 @@ class EpassportGui:
         ).start()
 
     def _terminal_auth_worker(self, cvc_paths, key_path: str) -> None:
+        self._trace_mark("terminal_auth", "running")
         try:
             from epassport_reader import pace
 
@@ -755,6 +791,7 @@ class EpassportGui:
             terminal_key = pace.load_ec_private_key(key_bytes)
             self._reader.terminal_authentication(chain, terminal_key)
             self._ta_done = True
+            self._trace_mark("terminal_auth", "ok")
             self.root.after(
                 0,
                 lambda: self._set_status(
@@ -770,6 +807,7 @@ class EpassportGui:
                 self.root.after(
                     0, lambda: self._log("Re-reading EAC-protected data groups ...")
                 )
+                self._trace_mark("eac_dg_read", "running")
                 pd = self._reader.read_all()
                 for tag, fid in ((0x63, 0x0103), (0x76, 0x0104)):
                     try:
@@ -809,6 +847,7 @@ class EpassportGui:
                         0, lambda e=exc: self._log(f"! PA re-run failed: {e}")
                     )
                 self.root.after(0, lambda p=pd: self._display(p))
+                self._trace_mark("eac_dg_read", "ok")
                 self.root.after(
                     0,
                     lambda: self._set_status(
@@ -816,8 +855,10 @@ class EpassportGui:
                     ),
                 )
             except Exception as exc:  # noqa: BLE001
+                self._trace_mark("eac_dg_read", "failed", detail=str(exc))
                 self.log_cb(f"! Re-read after TA failed: {exc}")
         except Exception as exc:  # noqa: BLE001
+            self._trace_mark("terminal_auth", "failed", detail=str(exc))
             self.log_cb(f"! Terminal Authentication failed: {exc}")
             self.root.after(
                 0,
@@ -840,14 +881,17 @@ class EpassportGui:
         threading.Thread(target=self._read_dg3_worker, daemon=True).start()
 
     def _read_dg3_worker(self) -> None:
+        self._trace_mark("eac_dg_read", "running")
         try:
             raw = self._reader.read_ef(0x0103)
             pd = self._last_pd
             pd.raw[0x63] = raw
+            self._trace_mark("eac_dg_read", "ok")
             self.root.after(0, lambda: self._log(f"DG3 read ({len(raw)} bytes)"))
             self.root.after(0, lambda p=pd: self._display(p))
             self.root.after(0, lambda: self._set_status("DG3 read."))
         except Exception as exc:  # noqa: BLE001
+            self._trace_mark("eac_dg_read", "failed", detail=str(exc))
             self.log_cb(f"! DG3 read failed: {exc}")
             self.root.after(0, lambda e=exc: self._set_status(f"DG3 read failed: {e}"))
         finally:
@@ -867,9 +911,11 @@ class EpassportGui:
         threading.Thread(target=self._active_auth_worker, daemon=True).start()
 
     def _active_auth_worker(self) -> None:
+        self._trace_mark("active_auth", "running")
         try:
             result = self._reader.active_authentication()
             if result.verified:
+                self._trace_mark("active_auth", "ok")
                 self.root.after(
                     0,
                     lambda: self._set_status(
@@ -884,6 +930,9 @@ class EpassportGui:
                     ),
                 )
             else:
+                self._trace_mark(
+                    "active_auth", "failed", detail=str(result.reason)
+                )
                 self.root.after(
                     0,
                     lambda r=result: self._set_status(
@@ -897,6 +946,7 @@ class EpassportGui:
                     ),
                 )
         except Exception as exc:  # noqa: BLE001
+            self._trace_mark("active_auth", "failed", detail=str(exc))
             self.log_cb(f"! Active Authentication failed: {exc}")
             self.root.after(
                 0, lambda e=exc: self._set_status(f"Active Authentication failed: {e}")
@@ -1306,6 +1356,8 @@ class EpassportGui:
         try:
             while True:
                 msg = self.log_queue.get_nowait()
+                if self._trace is not None:
+                    self._trace.add_event(msg)
                 self.log_text.configure(state="normal")
                 self.log_text.insert(tk.END, msg + "\n")
                 self.log_text.see(tk.END)
@@ -1315,6 +1367,153 @@ class EpassportGui:
         except queue.Empty:
             pass
         self._after_id = self.root.after(120, self._poll_logs)
+
+    # ------------------------------------------------------------------
+    # session coverage trace (EACv2 status for external review)
+    # ------------------------------------------------------------------
+
+    def _begin_trace(self, **meta: object) -> None:
+        """Start a fresh live-session trace (called at the start of a read)."""
+        if self._trace is None:
+            self._trace = SessionTrace()
+        self._trace.events = []
+        self._trace.begin_session(**meta)
+
+    def _trace_mark(
+        self, stage: str, status: str, detail: Optional[str] = None, sw: Optional[int] = None
+    ) -> None:
+        if self._trace is not None:
+            self._trace.mark(stage, status, detail=detail, sw=sw)
+
+    def _trace_fail_running(self, detail: Optional[str] = None) -> None:
+        """Mark every stage left ``running`` as failed (on an unexpected exit)."""
+        if self._trace is None:
+            return
+        for stage in ("connect", "card_access", "authentication", "chip_auth",
+                      "terminal_auth", "active_auth", "dg_read", "eac_dg_read"):
+            entry = self._trace.stages.get(stage)
+            if entry is not None and entry["status"] == "running":
+                self._trace.mark(stage, "failed", detail=detail or "aborted")
+
+    def _export_coverage_report(self) -> None:
+        if self._trace is None:
+            messagebox.showinfo(
+                "Export coverage report",
+                "No live session recorded yet. Run 'Read passport' first, then "
+                "optionally Chip/Terminal/Active Authentication, and export again.",
+            )
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export EACv2 coverage report (JSON)",
+            defaultextension=".json",
+            initialfile="coverage_report.json",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self._populate_report()
+            self._trace.finalize()
+            write_report_json(self._trace, path)
+            self.log_cb(f"Coverage report written to {path}")
+            messagebox.showinfo(
+                "Export coverage report",
+                f"Coverage report saved to:\n{path}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log_cb(f"! Coverage report export failed: {exc}")
+            messagebox.showerror(
+                "Export coverage report", f"Failed to write report:\n{exc}"
+            )
+
+    # ------------------------------------------------------------------
+    # report evidence assembly (read from the live session + reader)
+    # ------------------------------------------------------------------
+
+    def _populate_report(self) -> None:
+        """Attach cryptographic evidence / access facts to the report."""
+        tr = self._trace
+        if tr is None:
+            return
+        rd = self._reader
+        pd = self._last_pd
+
+        if rd is not None:
+            pev = getattr(rd, "pace_evidence", None)
+            if pev:
+                tr.record_evidence(
+                    "authentication", {"kind": "pace", "protocol": "PACE", **dict(pev)}
+                )
+            cev = getattr(rd, "ca_evidence", None)
+            if cev:
+                tr.record_evidence("chip_auth", {"kind": "chip_auth", **dict(cev)})
+            tev = getattr(rd, "ta_evidence", None)
+            if tev:
+                tr.record_evidence("terminal_auth", {"kind": "terminal_auth", **dict(tev)})
+
+        # EF.CVCA evidence (trust-point / rollover)
+        if pd is not None and getattr(pd, "cvca_info", None):
+            info = pd.cvca_info
+            cars = list(info.get("cars_text") or [])
+            link = bool(
+                rd
+                and getattr(rd, "ta_evidence", None)
+                and rd.ta_evidence.get("link_certificate")
+            )
+            tr.set_ef_cvca(
+                {
+                    "raw_len": info.get("raw_len"),
+                    "cars": cars,
+                    "current_car": cars[0] if cars else None,
+                    "previous_car": cars[1] if len(cars) > 1 else None,
+                    "rollover_active": len(cars) >= 2,
+                    "link_cert_present": link,
+                }
+            )
+            if rd and getattr(rd, "ta_evidence", None) and link:
+                tr.set_negative(
+                    "link_cert_rollover",
+                    "ok",
+                    detail="terminal chain carried a CVCA link certificate",
+                )
+
+        # DG access matrix (enforcement of access control before/after TA)
+        if pd is not None:
+            rows = self._dg_matrix(pd, rd)
+            if rows:
+                tr.set_dg_access(rows)
+                gated = [r for r in rows if r["eac_gated"]]
+                if any(tag == "0x63" for tag in (r["tag"] for r in gated)):
+                    tr.set_negative(
+                        "dg3_before_ta",
+                        "ok",
+                        detail="DG3 denied pre-TA, readable post-TA",
+                    )
+
+    def _dg_matrix(self, pd, rd):
+        """Build before/after-TA readability per data group (from EF.COM)."""
+        inventory = set(getattr(pd, "tag_list", []) or [])
+        pre = (rd._ef_success.get("pre") or set()) if rd else set()
+        post = (rd._ef_success.get("post") or set()) if rd else set()
+        rows = []
+        for tag in sorted(inventory):
+            fid = DATA_GROUP_TAG_TO_FID.get(tag)
+            if fid is None:
+                continue
+            name = DATA_GROUP_TAGS.get(tag, (f"DG{tag:02X}", ""))[0]
+            before = fid in pre
+            after = fid in post or tag in getattr(pd, "raw", {})
+            rows.append(
+                {
+                    "dg": name,
+                    "tag": f"0x{tag:02X}",
+                    "fid": f"0x{fid:04X}",
+                    "readable_before_ta": before,
+                    "readable_after_ta": after,
+                    "eac_gated": (not before) and after,
+                }
+            )
+        return rows
 
     def _about(self) -> None:
         messagebox.showinfo(

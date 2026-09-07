@@ -51,6 +51,7 @@ from .aa import (
     make_aa_challenge,
     parse_dg15_aa_key,
 )
+from .evidence import fingerprint
 
 LogFn = Callable[[str], None]
 
@@ -126,6 +127,12 @@ class EPassportReader:
         self.atr: Optional[bytes] = None
         self.pace_oid: Optional[bytes] = None
         self.pace_curve = DEFAULT_EC
+        # coverage-report evidence / access tracking
+        self.pace_evidence: Optional[Dict] = None
+        self.ca_evidence: Optional[Dict] = None
+        self.ta_evidence: Optional[Dict] = None
+        self._eac_ta_done = False
+        self._ef_success: Dict[str, set] = {"pre": set(), "post": set()}
 
     # ------------------------------------------------------------------
     # connection
@@ -193,6 +200,12 @@ class EPassportReader:
                 pw_ref=pw_ref,
                 curve=self.pace_curve,
             )
+        self._capture_pace_evidence()
+
+    def _capture_pace_evidence(self) -> None:
+        """Record PACE crypto evidence (fingerprints) from the SM session."""
+        ev = getattr(self.session, "pace_evidence", None) if self.session else None
+        self.pace_evidence = dict(ev) if ev else None
 
     def authenticate_hybrid(self) -> None:
         """Authenticate with a BAC-then-PACE hybrid (ICAO 9303 Supplement).
@@ -283,6 +296,11 @@ class EPassportReader:
         self.session = result.session
         self._ca_ifd_public = result.ifd_public
         self._chip_public_key_ref = ca_data.public_key_ref
+        ca_ev = dict(getattr(result.session, "ca_evidence", {}) or {})
+        ca_ev.setdefault("curve", curve.name)
+        ca_ev.setdefault("dg14_key_id", (ca_data.public_key_ref or b"").hex())
+        ca_ev.setdefault("chip_public_fp", fingerprint(ca_data.chip_public_key))
+        self.ca_evidence = ca_ev
         self.log("Chip Authentication OK - session upgraded to CA keys")
 
     def terminal_authentication(
@@ -339,6 +357,23 @@ class EPassportReader:
             x_icc,
             self.log,
         )
+        self._eac_ta_done = True
+
+        def _role(text: str):
+            for token in ("CVCA", "DV", "IS"):
+                if token in text.upper():
+                    return token
+            return None
+
+        self.ta_evidence = {
+            "trust_car": cvca_car.decode("latin-1", errors="replace"),
+            "terminal_chr": terminal_chr.decode("latin-1", errors="replace"),
+            "terminal_role": _role(terminal_chr.decode("latin-1", errors="replace")),
+            "chain_length": len(chain),
+            "link_certificate": len(chain) >= 2,
+            "previous_car_used": False,
+            "authorization": None,
+        }
 
     # EF.DG15 (LDS1): the Active-Authentication public key carrier.
     AA_FID = 0x010F
@@ -737,6 +772,9 @@ class EPassportReader:
         # targets EF.SOD again.
         if mf:
             self._restore_lds1_context()
+
+        phase = "post" if self._eac_ta_done else "pre"
+        self._ef_success[phase].add(fid)
 
         return bytes(buf)
 

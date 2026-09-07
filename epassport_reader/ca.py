@@ -27,6 +27,7 @@ import hashlib
 import secrets
 from typing import Callable, NamedTuple, Optional, Tuple
 
+from .evidence import fingerprint, oid_dotted
 from .pace import (
     EC_P256,
     _ec_decode_point,
@@ -132,13 +133,25 @@ def _do_ca_exchange(
 
     # 5. derive AES CA session keys and start a fresh PACE session (SSC = 0)
     kenc, kmac = derive_ca_keys(z, key_bits)
-    log(f"CA KSEnc ({len(kenc) * 8}-bit) = {kenc.hex(' ').upper()}")
-    log(f"CA KSMac ({len(kmac) * 8}-bit) = {kmac.hex(' ').upper()}")
+    log(f"CA KSEnc(fp) ({len(kenc) * 8}-bit) = {fingerprint(kenc)}")
+    log(f"CA KSMac(fp) ({len(kmac) * 8}-bit) = {fingerprint(kmac)}")
     new_session = SecureMessagingSession("PACE", kenc, kmac, b"\x00" * 16)
     # Preserve the IC's PACE ephemeral X (ID_IC for Terminal Authentication);
     # CA re-keys the channel but ID_IC is bound to the PACE session.
     if hasattr(session, "pace_icc_eph_x"):
         new_session.pace_icc_eph_x = session.pace_icc_eph_x
+    # Evidence for the coverage report (fingerprints only).
+    new_session.ca_evidence = {
+        "oid": oid_dotted(ca_mse_oid(key_bits)),
+        "oid_hex": ca_mse_oid(key_bits).hex(":").upper(),
+        "key_bits": key_bits,
+        "curve": curve.name,
+        "key_id": ref[0] if ref else 0,
+        "ifd_public_fp": fingerprint(q_ifd),
+        "shared_secret_fp": fingerprint(z),
+        "kenc_fp": fingerprint(kenc),
+        "kmac_fp": fingerprint(kmac),
+    }
     return ChipAuthResult(new_session, q_ifd, d_ifd)
 
 

@@ -22,6 +22,7 @@ import secrets
 from typing import Callable, NamedTuple, Optional, Tuple
 
 from .crypto import aes_ecb_decrypt, cmac8, derive_pace_key, derive_pace_key_mrz
+from .evidence import fingerprint, oid_dotted, pace_mapping_of
 from .sm import SecureMessagingSession
 from .tlvs import parse_tlvs
 
@@ -425,7 +426,7 @@ def do_pace(
         k_pi = derive_pace_key_mrz(password)  # ICAO PACE-MRZ double-hash
     else:
         k_pi = derive_pace_key(password)
-    log(f"PACE K_PI = {k_pi.hex(' ').upper()}")
+    log(f"PACE K_PI(fp) = {fingerprint(k_pi)}")
 
     # step 1: GET ENCRYPTED NONCE (CLA=0x10 for PACE)
     data, sw = send(GET_ENCRYPTED_NONCE)
@@ -475,8 +476,8 @@ def do_pace(
     shared_secret = _ec_point_mul(d_ifd, q_icc, ec)[0].to_bytes(ec.field_size, "big")
     k_enc = hashlib.sha1(shared_secret + b"\x00\x00\x00\x01").digest()[:16]
     k_mac = hashlib.sha1(shared_secret + b"\x00\x00\x00\x02").digest()[:16]
-    log(f"PACE KSEnc = {k_enc.hex(' ').upper()}")
-    log(f"PACE KSMac = {k_mac.hex(' ').upper()}")
+    log(f"PACE KSEnc(fp) = {fingerprint(k_enc)}")
+    log(f"PACE KSMac(fp) = {fingerprint(k_mac)}")
 
     # step 4: authentication tokens (CLA=0x10)
     # T_PCD = MAC(K_mac, encodePublicKey(Q_ICC)) authenticates the CARD's ephemeral key;
@@ -503,4 +504,17 @@ def do_pace(
     # Retain the IC's PACE ephemeral public key X-coordinate (Comp(PKDH,IC)),
     # used as ID_IC by Terminal Authentication (ICAO Doc 9303-11 §7.1.2).
     session.pace_icc_eph_x = q_icc[0].to_bytes(ec.field_size, "big")
+    # Evidence for the coverage report (fingerprints only, never raw keys).
+    session.pace_evidence = {
+        "oid": oid_dotted(oid),
+        "oid_hex": oid.hex(":").upper(),
+        "mapping": pace_mapping_of(oid),
+        "curve": ec.name,
+        "parameter_id": ec.param_id,
+        "password": "MRZ" if ref == PW_REF_MRZ else "CAN",
+        "nonce": nonce.hex(),  # decrypted nonce S (debug)
+        "shared_secret_fp": fingerprint(shared_secret),
+        "kenc_fp": fingerprint(k_enc),
+        "kmac_fp": fingerprint(k_mac),
+    }
     return session

@@ -643,6 +643,7 @@ def _oid_to_protocol(oid_hex: str) -> Optional[str]:
         "04007f00070202030202": "Chip Authentication (id-CA-ECDH-AES-CBC-CMAC-128)",
         "04007f00070202040202": "PACE (id-PACE-ECDH-GM-AES-CBC-CMAC-128)",
         "04007f00070202020202": "Terminal Authentication (id-TA-ECDSA-SHA256)",
+        "04007f0007020202": "Terminal Authentication (id-TA)",
         "2a864886f70d010702": "Document Digest (id-Digest with SHA-256)",
         "6086480165030402": "Digest Algorithm (id-SHA-256)",
         "04007f0007030201": "Chip Authentication (id-CA-ECDH-AES-CBC-CMAC-128)",
