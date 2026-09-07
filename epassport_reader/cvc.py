@@ -171,9 +171,6 @@ class ChipAuthData(NamedTuple):
     chip_public_key: bytes  # 65-byte uncompressed EC point (04 || X || Y)
     public_key_ref: bytes  # keyId, used as the TA MSE DO83 reference
     parameter_id: Optional[int] = None  # standardized domain parameter id (curve)
-<<<<<<< HEAD
-    protocol_oid: Optional[bytes] = None  # CA protocol OID from DG14
-=======
     ca_key_bits: Optional[int] = None  # 128 or 256 (CA AES session key length)
 
 
@@ -185,7 +182,6 @@ _NAMED_CURVE_OID_TO_PARAM = {
     bytes.fromhex("2B81040022"): 16,  # secp384r1
     bytes.fromhex("2B81040023"): 17,  # secp521r1
 }
->>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
 
 
 def _is_point(value: bytes) -> bool:
@@ -214,18 +210,10 @@ def _named_curve_param_id(data: bytes) -> Optional[int]:
 def _extract_spki(spki_content: bytes) -> Tuple[Optional[bytes], Optional[int]]:
     """Extract ``(point, parameter_id)`` from an EC SubjectPublicKeyInfo.
 
-<<<<<<< HEAD
-    Handles the SPKI layouts used by EF.DG14: ``SEQUENCE {
-    AlgorithmIdentifier(SEQUENCE { OID, INTEGER paramId | named-curve OID }),
-    BIT STRING <point> }``.  Returns the 65-byte uncompressed point and the
-    standardized domain parameter id (curve reference), either of which may
-    be absent.
-=======
     Handles the SPKI layout used by EF.DG14:
     ``SEQUENCE { AlgorithmIdentifier(SEQUENCE { OID, INTEGER paramId | OID namedCurve }), BIT STRING <point> }``.
     Returns the 65-byte uncompressed point and the standardized domain parameter
     id (curve reference), either of which may be absent.
->>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
     """
     point = None
     param_id = None
@@ -236,17 +224,12 @@ def _extract_spki(spki_content: bytes) -> Tuple[Optional[bytes], Optional[int]]:
                     v = int.from_bytes(avalue, "big")
                     if v:
                         param_id = v
-<<<<<<< HEAD
-            if param_id is None:
-                param_id = _named_curve_param_id(value)
-=======
                 elif (
                     atag == TAG_OID
                     and avalue in _NAMED_CURVE_OID_TO_PARAM
                     and param_id is None
                 ):
                     param_id = _NAMED_CURVE_OID_TO_PARAM[avalue]
->>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
         elif tag == 0x03 and value and value[0] == 0x00 and _is_point(value[1:]):
             point = value[1:]  # BIT STRING: 00 <point>
     return point, param_id
@@ -340,21 +323,10 @@ def parse_chip_auth_data(raw: bytes) -> Optional[ChipAuthData]:
     """Parse EF.DG14 into Chip-Authentication key material.
 
     DG14 is ``6E <len> <SecurityInfos>`` where
-<<<<<<< HEAD
-    ``SecurityInfos ::= SEQUENCE OF SecurityInfo``, so the chip key is three
-    SEQUENCE levels deep (``6E > SecurityInfos > SecurityInfo > fields``).
-
-    The protocol OID returned is the ECDH CA key-agreement OID (id-CA-ECDH-*)
-    that matches the chip key's keyId, which selects the CA suite / AES key
-    size for the MSE:Set AT and key derivation.
-
-    Returns ``None`` when the file does not carry a chip CA public key.
-=======
     ``SecurityInfos ::= SET OF SecurityInfo`` (some encoders use a flat
     ``SEQUENCE OF``), so the chip key is found by unwrapping the SecurityInfos
     node (``6E > SecurityInfos > SecurityInfo > fields``). Returns ``None`` when
     the file does not carry a chip CA public key.
->>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
     """
     if not raw:
         return None
@@ -368,29 +340,6 @@ def parse_chip_auth_data(raw: bytes) -> Optional[ChipAuthData]:
         except ValueError:
             pass
 
-<<<<<<< HEAD
-    chip_data = None
-    chip_oid = None
-    agreements: List[Tuple[Optional[bytes], bytes]] = []
-    seen: set = set()
-
-    def note_body(body: bytes) -> None:
-        nonlocal chip_data, chip_oid
-        if body in seen:
-            return
-        seen.add(body)
-        data = _parse_security_info(body)
-        if data is not None and chip_data is None:
-            point, key_id, param_id, protocol_oid = data
-            chip_data = (point, key_id or b"", param_id)
-            chip_oid = protocol_oid
-        agg_oid, agg_key_id = _ca_agreement_fields(body)
-        if agg_oid is not None:
-            agreements.append((agg_oid, agg_key_id))
-
-    for tag, value in parse_tlvs(raw):  # SecurityInfos
-        if tag not in (TAG_SEQUENCE, TAG_SET):
-=======
     raw = _unwrap_security_infos(raw)
 
     key_data = None
@@ -398,39 +347,12 @@ def parse_chip_auth_data(raw: bytes) -> Optional[ChipAuthData]:
 
     for tag, value in parse_tlvs(raw):  # SecurityInfo SEQUENCEs
         if tag != TAG_SEQUENCE:
->>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
             continue
         # the SecurityInfo may be one or two SEQUENCE levels deep
         inner_tags = (TAG_SEQUENCE,)
         if tag == TAG_SET:
             inner_tags = (TAG_SEQUENCE, TAG_SET)
         for inner_tag, inner_value in parse_tlvs(value):
-<<<<<<< HEAD
-            if inner_tag in inner_tags:
-                note_body(inner_value)
-        note_body(value)
-
-    if chip_data is None:
-        return None
-
-    point, key_id, param_id = chip_data
-    protocol_oid = chip_oid
-    matched = False
-    for agg_oid, agg_key_id in agreements:
-        if key_id and agg_key_id == key_id:
-            protocol_oid = agg_oid
-            matched = True
-            break
-    if not matched and agreements:
-        best = agreements[0][0]
-        for agg_oid, _agg_key_id in agreements:
-            if agg_oid is not None and agg_oid.endswith(b"\x04"):
-                best = agg_oid
-                break
-        protocol_oid = best
-
-    return ChipAuthData(point, key_id, param_id, protocol_oid)
-=======
             if inner_tag == TAG_SEQUENCE:
                 if ca_bits is None:
                     ca_bits = _ca_key_bits_of(inner_value)
@@ -445,13 +367,8 @@ def parse_chip_auth_data(raw: bytes) -> Optional[ChipAuthData]:
 
     if key_data is None:
         return None
-    return ChipAuthData(
-        key_data.chip_public_key,
-        key_data.public_key_ref,
-        key_data.parameter_id,
-        ca_bits,
-    )
->>>>>>> 954ecba (switch to brainpoolp256r1 ec curve for cvca cert generator)
+    point, key_id, param_id, _protocol_oid = key_data
+    return ChipAuthData(point, key_id, param_id, ca_bits)
 
 
 def _extract_security_info(body: bytes) -> Dict[str, object]:
