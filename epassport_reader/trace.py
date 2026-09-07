@@ -77,11 +77,11 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _readiness(func: float, sec: float, neg: float) -> str:
+def _readiness(func: float, sec: float, neg: Optional[float]) -> str:
     if func < 0.3:
         return "setup-only / not exercised"
     if func >= 0.8 and sec >= 0.8:
-        if neg >= 0.8:
+        if neg is not None and neg >= 0.8:
             return "Advanced EACv2 (positive + negative)"
         return "Advanced EACv2 (positive path)"
     return "Partial EACv2"
@@ -106,6 +106,14 @@ class SessionTrace:
         self.events: List[Dict[str, str]] = []
         self.notes: List[str] = []
         self._event_cap = 12000
+        # Negative coverage is collected but disabled in the default report
+        # until a negative harness can populate it meaningfully.
+        self.include_negative = False
+
+    def enable_negative(self) -> None:
+        """Include the negative-coverage matrix in emitted reports."""
+        with self._lock:
+            self.include_negative = True
 
     # ------------------------------------------------------------------
     # collection
@@ -213,7 +221,7 @@ class SessionTrace:
             return ok / len(items)
 
         func = frac(self.functional)
-        neg = frac(self.negative)
+        neg = frac(self.negative) if self.include_negative else None
 
         # Security coverage: success of security stages AND, where the stage
         # must produce crypto evidence (CA/TA), that evidence was recorded.
@@ -230,25 +238,33 @@ class SessionTrace:
                 sec_ok += 1
         sec = (sec_ok / sec_total) if sec_total else 0.0
 
-        return {
+        result: Dict[str, object] = {
             "functional": round(func, 3),
             "security": round(sec, 3),
-            "negative": round(neg, 3),
             "overall_readiness": _readiness(func, sec, neg),
         }
+        if neg is not None:
+            result["negative"] = round(neg, 3)
+        return result
 
     def to_dict(self) -> Dict[str, object]:
         with self._lock:
             stages = [dict(self.stages[s["id"]]) for s in STAGES]
             functional = [dict(self.functional[ft["id"]]) for ft in FUNCTIONAL_TESTS]
-            negative = [dict(self.negative[nt["id"]]) for nt in NEGATIVE_TESTS]
             evidence = {k: dict(v) for k, v in self.evidence.items()}
             dg_access = [dict(r) for r in self.dg_access] if self.dg_access else None
             ef_cvca = dict(self.ef_cvca) if self.ef_cvca else None
             events = [dict(e) for e in self.events]
             meta = dict(self.meta)
             notes = list(self.notes)
+            include_negative = self.include_negative
         scores = self._scores()
+        coverage: Dict[str, object] = {
+            "functional": functional,
+            "security_stages": list(SECURITY_STAGES),
+        }
+        if include_negative:
+            coverage["negative"] = [dict(self.negative[nt["id"]]) for nt in NEGATIVE_TESTS]
         return {
             "report": self.report_name,
             "schema_version": self.schema_version,
@@ -256,11 +272,7 @@ class SessionTrace:
             "started_at": self.started_at,
             "session": meta,
             "result": scores,
-            "coverage": {
-                "functional": functional,
-                "security_stages": list(SECURITY_STAGES),
-                "negative": negative,
-            },
+            "coverage": coverage,
             "evidence": {
                 "stages": evidence,
                 "ef_cvca": ef_cvca,
@@ -290,11 +302,13 @@ def summarize(report: Dict[str, object]) -> str:
     r = report.get("result", {})
     meta = report.get("session", {})
     protocol = meta.get("session_protocol") or meta.get("protocol_requested") or "?"
+    neg = r.get("negative")
+    neg_txt = f"{neg:.0%}" if neg is not None else "n/a"
     return (
         f"readiness={r.get('overall_readiness', '?')} "
         f"functional={r.get('functional', 0):.0%} "
         f"security={r.get('security', 0):.0%} "
-        f"negative={r.get('negative', 0):.0%} "
+        f"negative={neg_txt} "
         f"protocol={protocol}"
     )
 

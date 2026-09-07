@@ -84,6 +84,7 @@ class EpassportGui:
         self._reader = None  # connected EPassportReader (for CA/TA)
         self._ca_done = False  # Chip Authentication performed in session
         self._ta_done = False  # Terminal Authentication performed
+        self._reading = False  # a read is currently in progress
         self._trace: Optional[SessionTrace] = None  # live session coverage trace
         self._readers: List[str] = []
         self._recent_mrz: Optional[str] = None
@@ -509,6 +510,16 @@ class EpassportGui:
             reader_idx = self._readers.index(reader_name)
         except ValueError:
             reader_idx = 0
+
+        if self._reading:
+            self._log("A read is already in progress - ignoring this request.")
+            return
+        # Releasing the previous connection first means a second 'Read passport'
+        # never opens a second PC/SC handle on the same card, which some readers
+        # answer with a card RESET (dropping the running state / SM session).
+        self._close_previous_reader()
+        self._reading = True
+
         self._begin_trace(
             protocol_requested=protocol_display,
             reader=reader_name,
@@ -526,6 +537,27 @@ class EpassportGui:
             args=(reader_idx, protocol, doc, dob, expiry, can, protocol_display),
             daemon=True,
         ).start()
+
+    def _close_previous_reader(self) -> None:
+        """Disconnect any reader left over from an earlier read.
+
+        Keeps at most one open PC/SC connection so a fresh read starts cleanly
+        instead of stacking a second handle on the same card (which many
+        readers turn into a card reset).
+        """
+        rd = self._reader
+        if rd is not None:
+            try:
+                conn = getattr(getattr(rd, "card", None), "conn", None)
+                if conn is not None:
+                    conn.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            rd.card = None
+            rd.session = None
+        self._reader = None
+        self._ca_done = False
+        self._ta_done = False
 
     def _read_worker(
         self, reader_idx, protocol, doc, dob, expiry, can, protocol_display
@@ -671,6 +703,7 @@ class EpassportGui:
             self.log_cb(f"! ERROR: {exc}")
             self.root.after(0, lambda e=exc: self._set_status(f"Failed: {e}"))
         finally:
+            self._reading = False
             self.root.after(0, lambda: self.read_btn.configure(state="normal"))
 
     def _keep_reader(self, reader) -> None:
@@ -1600,6 +1633,7 @@ class EpassportGui:
     def _on_close(self) -> None:
         if self._after_id:
             self.root.after_cancel(self._after_id)
+        self._close_previous_reader()
         self.root.destroy()
 
 
