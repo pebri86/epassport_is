@@ -178,7 +178,7 @@ class EpassportGui:
         self.root.config(menu=menubar)
 
     def _build_toolbar(self) -> None:
-        bar = ctk.CTkFrame(self.root, corner_radius=0)
+        bar = ctk.CTkFrame(self.root, corner_radius=5)
         bar.pack(side="top", fill="x", padx=8, pady=(8, 4))
 
         ui_font = ctk.CTkFont(size=13)
@@ -312,8 +312,16 @@ class EpassportGui:
         self.tab_sec = self.tabview.add("Security (SOD/PA)")
         self.tab_log = self.tabview.add("Log")
 
-        # consolidated "passport data page" tab
-        self._build_datapage(self.tab_page)
+        # consolidated "passport data page" tab (built lazily on first read)
+        self._dp_tab = self.tab_page
+        self._dp_built = False
+        self._dp_placeholder = ctk.CTkLabel(
+            self.tab_page,
+            text="Press 'Read passport' to display the data page.",
+            text_color=("gray45", "gray65"),
+            font=ctk.CTkFont(size=14),
+        )
+        self._dp_placeholder.pack(expand=True)
 
         # data-groups tab
         self.groups_table = self._make_table(
@@ -449,6 +457,10 @@ class EpassportGui:
 
     def _refresh_datapage(self, pd: PassportData) -> None:
         """Render the read data as a single passport-style data page."""
+        if not self._dp_built:
+            self._dp_placeholder.pack_forget()
+            self._build_datapage(self._dp_tab)
+            self._dp_built = True
         self._clear_datapage()
         dg1 = pd.dg1 or {}
         state = dg1.get("issuing_state", "")

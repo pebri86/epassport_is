@@ -1,0 +1,3 @@
+# Build-only dependencies for packaging the eMRTD Reader (one-file exe).
+# `pip install -r requirements.txt -r packaging/requirements-build.txt`
+pyinstaller>=6.0
