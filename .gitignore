@@ -5,6 +5,13 @@
 __pycache__/
 *.py[cod]
 
+# PyInstaller build artefacts
+build/
+dist/
+packaging/Output/
+*.pyz
+*.toc
+
 # Compiled Java
 *.class
 
