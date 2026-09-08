@@ -1,6 +1,6 @@
 # eMRTD Reader
 
-A e-MRTD **e-passport inspection tool** that reads ICAO Doc 9303 passports
+eMRTD Reader is **e-MRTD/e-passport inspection tool** that reads ICAO Doc 9303 passports
 over PC/SC, authenticates with **BAC / PACE**, and supports the full **EACv2**
 (Terminal + Chip Authentication) and **Active Authentication** flow. It renders
 the read data as a single passport-style *data page* and can export an
