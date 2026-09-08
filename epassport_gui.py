@@ -27,10 +27,12 @@ customtkinter.
 from __future__ import annotations
 
 import io
+import json
 import os
 import queue
 import threading
 import tkinter as tk
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional
@@ -88,8 +90,8 @@ class EpassportGui:
         self._trace: Optional[SessionTrace] = None  # live session coverage trace
         self._readers: List[str] = []
         self._recent_mrz: Optional[str] = None
-        self._recent_mrz_file = Path.home() / ".epassport_is_recent_mrz"
-        self._load_recent_mrz_from_disk()
+        self._mrz_history: List[Dict[str, object]] = []  # newest first
+        self._mrz_history_file = Path.home() / ".epassport_is_mrz_history.json"
 
         self.doc_var = tk.StringVar()
         self.dob_var = tk.StringVar()
@@ -101,6 +103,7 @@ class EpassportGui:
         self._build_toolbar()
         self._build_main()
         self._build_statusbar()
+        self._load_mrz_history_from_disk()
 
         self._after_id = self.root.after(120, self._poll_logs)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -119,7 +122,14 @@ class EpassportGui:
 
         mrz_menu = tk.Menu(menubar, tearoff=0)
         mrz_menu.add_command(label="Enter MRZ (two lines)...", command=self._enter_mrz)
-        mrz_menu.add_command(label="Load recent MRZ", command=self._load_recent_mrz)
+        mrz_menu.add_separator()
+        self._mrz_hist_menu = tk.Menu(mrz_menu, tearoff=0)
+        mrz_menu.add_cascade(
+            label="Load from read history...", menu=self._mrz_hist_menu
+        )
+        mrz_menu.add_command(
+            label="Clear read history", command=self._clear_mrz_history
+        )
         menubar.add_cascade(label="MRZ", menu=mrz_menu)
 
         card_menu = tk.Menu(menubar, tearoff=0)
@@ -444,6 +454,8 @@ class EpassportGui:
         self.status_var = tk.StringVar(
             value="Ready. Select a reader and press Read passport."
         )
+        self._progress = ctk.CTkProgressBar(self.root, mode="determinate", height=4)
+        self._progress_shown = False
         bar = ctk.CTkLabel(
             self.root,
             textvariable=self.status_var,
@@ -531,6 +543,7 @@ class EpassportGui:
         self._log(
             f"--- Starting read: protocol={protocol_display}, reader={reader_name}"
         )
+        self._progress_on()
 
         threading.Thread(
             target=self._read_worker,
@@ -705,6 +718,7 @@ class EpassportGui:
         finally:
             self._reading = False
             self.root.after(0, lambda: self.read_btn.configure(state="normal"))
+            self.root.after(0, self._progress_off)
 
     def _keep_reader(self, reader) -> None:
         """Retain the connected+authenticated reader for the CA/TA/AA actions."""
@@ -718,6 +732,7 @@ class EpassportGui:
 
     def _set_buttons_busy(self, busy: bool) -> None:
         if busy:
+            self._progress_on()
             self.ca_btn.configure(state="disabled")
             self.ta_btn.configure(state="disabled")
             self.aa_btn.configure(state="disabled")
@@ -734,6 +749,7 @@ class EpassportGui:
         self.read_btn.configure(
             state="normal" if self.reader_combo.get() else "disabled"
         )
+        self._progress_off()
 
     # ------------------------------------------------------------------
     # EAC: Chip Authentication + Terminal Authentication
@@ -1018,7 +1034,6 @@ class EpassportGui:
         self.dob_var.set(dob)
         self.expiry_var.set(expiry)
         self._recent_mrz = mrz
-        self._save_recent_mrz_to_disk()
         self.log_cb(f"Loaded MRZ: doc={doc} dob={dob} doe={expiry}")
         return True
 
@@ -1066,39 +1081,86 @@ class EpassportGui:
         win.bind("<Escape>", lambda _e: cancel())
         txt.focus_set()
 
-    def _load_recent_mrz_from_disk(self) -> None:
-        """Load the most recent MRZ from the persistence file, if any."""
-        try:
-            if self._recent_mrz_file.exists():
-                text = self._recent_mrz_file.read_text(encoding="utf-8").strip()
-                if text:
-                    self._recent_mrz = text
-        except OSError:
-            pass
+    # ------------------------------------------------------------------
+    # MRZ history (successful reads, persisted for reuse)
+    # ------------------------------------------------------------------
 
-    def _save_recent_mrz_to_disk(self) -> None:
-        """Persist the current recent MRZ to disk."""
-        try:
-            if self._recent_mrz:
-                self._recent_mrz_file.parent.mkdir(parents=True, exist_ok=True)
-                self._recent_mrz_file.write_text(self._recent_mrz, encoding="utf-8")
-            else:
-                try:
-                    self._recent_mrz_file.unlink()
-                except OSError:
-                    pass
-        except OSError:
-            pass
+    def _mrz_history_label(self, entry: Dict[str, object]) -> str:
+        holder = entry.get("holder") or ""
+        ident = holder if holder else str(entry.get("doc", "?"))
+        return f"{ident:<22} {entry.get('doc', ''):<10} {entry.get('dob', ''):<7}"
 
-    def _load_recent_mrz(self) -> None:
-        """Reload the doc/DOB/expiry fields from the most recent MRZ."""
-        if not self._recent_mrz:
-            messagebox.showinfo(
-                "Recent MRZ", "No MRZ entered yet. Use MRZ -> Enter MRZ first."
+    def _rebuild_mrz_hist_menu(self) -> None:
+        menu = getattr(self, "_mrz_hist_menu", None)
+        if menu is None:
+            return
+        menu.delete(0, "end")
+        if not self._mrz_history:
+            menu.add_command(
+                label="(no reads recorded yet)", state="disabled"
             )
             return
-        if not self._apply_mrz(self._recent_mrz):
-            messagebox.showerror("Recent MRZ", "Stored MRZ could not be parsed.")
+        for i, entry in enumerate(self._mrz_history):
+            menu.add_command(
+                label=self._mrz_history_label(entry),
+                command=lambda e=entry: self._apply_mrz(str(e["mrz"])),
+            )
+
+    def _load_mrz_history_from_disk(self) -> None:
+        try:
+            if self._mrz_history_file.exists():
+                data = json.loads(
+                    self._mrz_history_file.read_text(encoding="utf-8")
+                )
+                if isinstance(data, list):
+                    self._mrz_history = [
+                        e
+                        for e in data
+                        if isinstance(e, dict) and isinstance(e.get("mrz"), str)
+                    ]
+        except (OSError, ValueError):
+            self._mrz_history = []
+        if self._mrz_history:
+            self._recent_mrz = str(self._mrz_history[0]["mrz"])
+        self._rebuild_mrz_hist_menu()
+
+    def _save_mrz_history_to_disk(self) -> None:
+        try:
+            self._mrz_history_file.parent.mkdir(parents=True, exist_ok=True)
+            self._mrz_history_file.write_text(
+                json.dumps(self._mrz_history, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+    def _remember_mrz(self, mrz: str, holder: str = "", nationality: str = "") -> None:
+        """Record a successful read's MRZ at the top of the history."""
+        fields = self._mrz_to_fields(mrz)
+        if not fields:
+            return
+        doc, dob, expiry = fields
+        entry = {
+            "mrz": mrz,
+            "doc": doc,
+            "dob": dob,
+            "expiry": expiry,
+            "holder": holder,
+            "nationality": nationality,
+            "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        self._mrz_history = [
+            e for e in self._mrz_history if e.get("mrz") != mrz
+        ]
+        self._mrz_history.insert(0, entry)
+        del self._mrz_history[30:]  # cap the stored history
+        self._recent_mrz = mrz
+        self._save_mrz_history_to_disk()
+        self._rebuild_mrz_hist_menu()
+
+    def _clear_mrz_history(self) -> None:
+        self._mrz_history = []
+        self._save_mrz_history_to_disk()
+        self._rebuild_mrz_hist_menu()
 
     # ------------------------------------------------------------------
     # display
@@ -1122,8 +1184,12 @@ class EpassportGui:
                 "line2", ""
             ).replace(" ", "<")
             if mrz:
-                self._recent_mrz = mrz
-                self._save_recent_mrz_to_disk()
+                name = f"{pd.dg1.get('surname','')} {pd.dg1.get('given_names','')}".strip()
+                self._remember_mrz(
+                    mrz,
+                    holder=name,
+                    nationality=pd.dg1.get("nationality", ""),
+                )
             for key, label in FIELD_LABELS.items():
                 value = pd.dg1.get(key, "")
                 self.mrz_table.insert("", tk.END, values=(label, value))
@@ -1384,6 +1450,35 @@ class EpassportGui:
 
     def _set_status(self, msg: str) -> None:
         self.status_var.set(msg)
+
+    def _progress_on(self) -> None:
+        """Show an animated progress bar (must be called on the UI thread)."""
+        p = getattr(self, "_progress", None)
+        if p is None:
+            return
+        try:
+            if not self._progress_shown:
+                p.pack(side="bottom", fill="x")
+                self._progress_shown = True
+            p.configure(mode="indeterminate")
+            p.start()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _progress_off(self) -> None:
+        """Stop and hide the progress bar (UI thread)."""
+        p = getattr(self, "_progress", None)
+        if p is None:
+            return
+        try:
+            p.stop()
+            p.configure(mode="determinate")
+            p.set(0)
+            if self._progress_shown:
+                p.pack_forget()
+                self._progress_shown = False
+        except Exception:  # noqa: BLE001
+            pass
 
     def _poll_logs(self) -> None:
         try:
