@@ -72,6 +72,20 @@ FIELD_LABELS: Dict[str, str] = {
     "composite_check": "Composite check digit",
 }
 
+# Fields shown on the consolidated passport "data page" (DG1 keys -> caption).
+PASSPORT_FIELDS = (
+    ("document_type", "Type"),
+    ("issuing_state", "Issuing state"),
+    ("surname", "Surname"),
+    ("given_names", "Given names"),
+    ("document_number", "Document number"),
+    ("nationality", "Nationality"),
+    ("date_of_birth", "Date of birth"),
+    ("sex", "Sex"),
+    ("date_of_expiry", "Date of expiry"),
+    ("personal_number", "Personal number"),
+)
+
 
 class EpassportGui:
     def __init__(self, root: ctk.CTk):
@@ -293,61 +307,13 @@ class EpassportGui:
         self.tabview.pack(fill="both", expand=True)
         self.tabview.configure(segmented_button_fg_color=("gray80", "gray22"))
 
-        self.tab_mrz = self.tabview.add("Passport (DG1)")
-        self.tab_photo = self.tabview.add("Portrait (DG2)")
-        self.tab_sign = self.tabview.add("Signature (DG7)")
-        self.tab_pers = self.tabview.add("Personal data (DG11)")
-        self.tab_doc = self.tabview.add("Document data (DG12)")
-        self.tab_opt = self.tabview.add("Optional data (DG13)")
+        self.tab_page = self.tabview.add("Passport")
         self.tab_groups = self.tabview.add("Data groups")
         self.tab_sec = self.tabview.add("Security (SOD/PA)")
         self.tab_log = self.tabview.add("Log")
 
-        # MRZ tab
-        self.mrz_lines = tk.Text(
-            self.tab_mrz,
-            height=4,
-            font=("TkFixedFont", 14),
-            background="#f8f8f8",
-            relief="flat",
-            padx=8,
-            pady=6,
-        )
-        self.mrz_lines.pack(fill="x", padx=6, pady=(6, 0))
-        self.mrz_lines.tag_configure("hl", background="#fff7cc")
-
-        mrz_frame = self._make_table(self.tab_mrz, ("Field", "Value"))
-        mrz_frame.pack(fill="both", expand=True, padx=6, pady=(6, 6))
-        self.mrz_table = mrz_frame.table
-
-        # image tabs
-        self.photo_canvas = self._make_image_canvas(
-            self.tab_photo, "No portrait (DG2) on card."
-        )
-        self.photo_canvas.pack(fill="both", expand=True, padx=6, pady=6)
-        self.photo_meta = ctk.CTkLabel(
-            self.tab_photo, text="", text_color=("gray40", "gray60")
-        )
-        self.photo_meta.pack(anchor="w", padx=8, pady=(0, 6))
-
-        self.sign_canvas = self._make_image_canvas(
-            self.tab_sign, "No signature (DG7) on card."
-        )
-        self.sign_canvas.pack(fill="both", expand=True, padx=6, pady=6)
-        self.sign_meta = ctk.CTkLabel(
-            self.tab_sign, text="", text_color=("gray40", "gray60")
-        )
-        self.sign_meta.pack(anchor="w", padx=8, pady=(0, 6))
-
-        # text DG tables
-        self.pers_table = self._make_table(
-            self.tab_pers, ("Tag", "Field", "Value")
-        ).table
-        self.pers_table.master.pack(fill="both", expand=True, padx=6, pady=6)
-        self.doc_table = self._make_table(self.tab_doc, ("Tag", "Field", "Value")).table
-        self.doc_table.master.pack(fill="both", expand=True, padx=6, pady=6)
-        self.opt_table = self._make_table(self.tab_opt, ("Tag", "Field", "Value")).table
-        self.opt_table.master.pack(fill="both", expand=True, padx=6, pady=6)
+        # consolidated "passport data page" tab
+        self._build_datapage(self.tab_page)
 
         # data-groups tab
         self.groups_table = self._make_table(
@@ -390,6 +356,163 @@ class EpassportGui:
         )
         self.log_text.pack(fill="both", expand=True, padx=0, pady=0)
         self.log_text.configure(state="disabled")
+
+    def _build_datapage(self, tab) -> None:
+        """Build the consolidated 'Passport' data-page tab."""
+        scroll = ctk.CTkScrollableFrame(tab)
+        scroll.pack(fill="both", expand=True, padx=6, pady=6)
+        self._dp_scroll = scroll
+
+        card = ctk.CTkFrame(scroll, corner_radius=10)
+        card.pack(fill="x", padx=6, pady=(6, 0))
+
+        self._dp_header = ctk.CTkLabel(
+            card, text="", font=ctk.CTkFont(size=16, weight="bold")
+        )
+        self._dp_header.pack(anchor="w", padx=16, pady=(12, 0))
+        self._dp_sub = ctk.CTkLabel(
+            card,
+            text="",
+            text_color=("gray40", "gray60"),
+            font=ctk.CTkFont(size=12),
+        )
+        self._dp_sub.pack(anchor="w", padx=16, pady=(0, 4))
+
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+
+        # right column: photo + signature thumbnails
+        imgs = ctk.CTkFrame(row, fg_color="transparent")
+        imgs.pack(side="right", anchor="n", padx=(8, 4), pady=4)
+        self.dp_photo_canvas = self._make_image_canvas(imgs, "No portrait (DG2)")
+        self.dp_photo_canvas.configure(width=140, height=176)
+        self.dp_photo_canvas.pack(anchor="e")
+        self.dp_sign_canvas = self._make_image_canvas(imgs, "No signature (DG7)")
+        self.dp_sign_canvas.configure(width=140, height=48)
+        self.dp_sign_canvas.pack(anchor="e", pady=(6, 0))
+
+        # left column: field grid (two columns of caption/value groups)
+        self._dp_fields = ctk.CTkFrame(row, fg_color="transparent")
+        self._dp_fields.pack(side="left", fill="both", expand=True, padx=(4, 8))
+        self._page_vars: Dict[str, tk.StringVar] = {}
+        cols = [ctk.CTkFrame(self._dp_fields, fg_color="transparent") for _ in range(2)]
+        for col in cols:
+            col.grid_columnconfigure(0, weight=1)
+        for i, (key, caption) in enumerate(PASSPORT_FIELDS):
+            group = ctk.CTkFrame(cols[i % 2], fg_color="transparent")
+            group.grid(row=i // 2, column=0, sticky="we", padx=(0, 12), pady=3)
+            ctk.CTkLabel(
+                group, text=caption.upper(), font=ctk.CTkFont(size=10),
+                text_color=("gray40", "gray60"),
+            ).pack(anchor="w")
+            var = tk.StringVar(value="")
+            ctk.CTkLabel(
+                group, textvariable=var, anchor="w", font=ctk.CTkFont(size=14, weight="bold")
+            ).pack(anchor="w")
+            self._page_vars[key] = var
+        self._dp_fields.grid_columnconfigure(0, weight=1)
+        self._dp_fields.grid_columnconfigure(1, weight=1)
+        cols[0].grid(row=0, column=0, sticky="nsew")
+        cols[1].grid(row=0, column=1, sticky="nsew")
+
+        # MRZ zone
+        self._dp_mrz = tk.Text(
+            card,
+            height=4,
+            font=("TkFixedFont", 13),
+            background="#f4f4f4",
+            relief="flat",
+            padx=10,
+            pady=4,
+        )
+        self._dp_mrz.pack(fill="x", padx=12, pady=(4, 12))
+
+        # optional DG11-13 area
+        self._dp_extra_head = ctk.CTkLabel(
+            scroll, text="Additional data (DG11-13)", font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self._dp_extra_head.pack(anchor="w", padx=10, pady=(12, 0))
+        self._dp_extra = ctk.CTkFrame(scroll, corner_radius=8)
+        self._dp_extra.pack(fill="x", padx=6, pady=(4, 10))
+
+    def _clear_datapage(self) -> None:
+        for child in self._dp_extra.winfo_children():
+            child.destroy()
+        self._dp_header.configure(text="")
+        self._dp_sub.configure(text="")
+        for var in self._page_vars.values():
+            var.set("")
+        self._dp_mrz.configure(state="normal")
+        self._dp_mrz.delete("1.0", tk.END)
+        self._show_image(self.dp_photo_canvas, None)
+        self._show_image(self.dp_sign_canvas, None)
+
+    def _refresh_datapage(self, pd: PassportData) -> None:
+        """Render the read data as a single passport-style data page."""
+        self._clear_datapage()
+        dg1 = pd.dg1 or {}
+        state = dg1.get("issuing_state", "")
+        self._dp_header.configure(
+            text=f"{state} · PASSPORT" if state else "PASSPORT"
+        )
+        name = f"{dg1.get('surname', '')} {dg1.get('given_names', '')}".strip()
+        self._dp_sub.configure(text=name or "No passport data read yet.")
+
+        for key, _caption in PASSPORT_FIELDS:
+            var = self._page_vars.get(key)
+            if var is not None:
+                var.set(dg1.get(key, "") or "")
+
+        self._dp_mrz.configure(state="normal")
+        if dg1.get("line1"):
+            # decode parser outputs spaces for the '<' fillers; show them again
+            l1 = dg1["line1"].replace(" ", "<")
+            l2 = dg1.get("line2", "").replace(" ", "<")
+            self._dp_mrz.insert(tk.END, "  " + l1 + "\n")
+            self._dp_mrz.insert(tk.END, "  " + l2 + "\n")
+        else:
+            self._dp_mrz.insert(tk.END, "  No DG1 (MRZ) data on card.\n")
+        self._dp_mrz.configure(state="disabled")
+
+        self._show_image(
+            self.dp_photo_canvas, pd.dg2.get("image_bytes") if pd.dg2 else None
+        )
+        self._show_image(
+            self.dp_sign_canvas, pd.dg7.get("image_bytes") if pd.dg7 else None
+        )
+
+        present = 0
+        for tag in (0x6B, 0x6C, 0x6D):
+            fields = pd.text_dgs.get(tag, [])
+            if not fields:
+                continue
+            present += 1
+            header = ctk.CTkLabel(
+                self._dp_extra,
+                text=DATA_GROUP_TAGS.get(tag, (f"DG{tag:02X}", ""))[0],
+                anchor="w",
+                font=ctk.CTkFont(size=12, weight="bold"),
+            )
+            header.pack(anchor="w", padx=10, pady=(8, 0))
+            for f in fields:
+                label = f"{f.get('name', f.get('tag', '?'))}"
+                text = f.get("value", "")
+                row_frame = ctk.CTkFrame(self._dp_extra, fg_color="transparent")
+                row_frame.pack(fill="x", padx=10)
+                ctk.CTkLabel(
+                    row_frame, text=label, anchor="w", width=220,
+                    text_color=("gray40", "gray60"), font=ctk.CTkFont(size=12),
+                ).pack(side="left")
+                ctk.CTkLabel(
+                    row_frame, text=str(text), anchor="w", font=ctk.CTkFont(size=12)
+                ).pack(side="left", padx=(8, 0))
+        if not present:
+            ctk.CTkLabel(
+                self._dp_extra,
+                text="No DG11-13 (personal / document / optional) data on card.",
+                text_color=("gray40", "gray60"),
+                font=ctk.CTkFont(size=12),
+            ).pack(anchor="w", padx=10, pady=8)
 
     def _field(self, parent, label: str, var: tk.StringVar, row: int) -> None:
         ctk.CTkLabel(parent, text=label, font=ctk.CTkFont(size=14)).grid(
@@ -1174,12 +1297,8 @@ class EpassportGui:
     def _display(self, pd: PassportData) -> None:
         self._last_pd = pd
 
-        # --- MRZ / DG1 ------------------------------------------------
-        self._clear_table(self.mrz_table)
-        self.mrz_lines.delete("1.0", tk.END)
+        # --- consolidated passport data page (DG1 + images + DG11-13) ---
         if pd.dg1:
-            self.mrz_lines.insert(tk.END, "  " + pd.dg1["line1"] + "\n")
-            self.mrz_lines.insert(tk.END, "  " + pd.dg1["line2"] + "\n", "hl")
             mrz = pd.dg1.get("line1", "").replace(" ", "<") + pd.dg1.get(
                 "line2", ""
             ).replace(" ", "<")
@@ -1190,11 +1309,7 @@ class EpassportGui:
                     holder=name,
                     nationality=pd.dg1.get("nationality", ""),
                 )
-            for key, label in FIELD_LABELS.items():
-                value = pd.dg1.get(key, "")
-                self.mrz_table.insert("", tk.END, values=(label, value))
-        else:
-            self.mrz_lines.insert(tk.END, "  No DG1 (MRZ) data on card.\n")
+        self._refresh_datapage(pd)
 
         if pd.dg1:
             name = f"{pd.dg1['surname']} {pd.dg1['given_names']}".strip() or "(unknown)"
@@ -1209,44 +1324,6 @@ class EpassportGui:
             )
         else:
             self.mrz_summary.configure(text="No passport read yet.")
-
-        # --- images ----------------------------------------------------
-        self._show_image(
-            self.photo_canvas, pd.dg2.get("image_bytes") if pd.dg2 else None
-        )
-        if pd.dg2 and pd.dg2.get("image_bytes"):
-            meta = pd.dg2.get("metadata") or {}
-            bits = ", ".join(f"{k}={v}" for k, v in meta.items())
-            self.photo_meta.configure(
-                text=f"DG2  {pd.dg2.get('image_format', '')}  {bits}"
-            )
-        else:
-            self.photo_meta.configure(text="")
-
-        self._show_image(
-            self.sign_canvas, pd.dg7.get("image_bytes") if pd.dg7 else None
-        )
-        if pd.dg7 and pd.dg7.get("image_bytes"):
-            self.sign_meta.configure(text=f"DG7  {pd.dg7.get('image_format', '')}")
-        else:
-            self.sign_meta.configure(text="")
-
-        # --- text data groups ------------------------------------------
-        for tag, table in (
-            (0x6B, self.pers_table),
-            (0x6C, self.doc_table),
-            (0x6D, self.opt_table),
-        ):
-            self._clear_table(table)
-            fields = pd.text_dgs.get(tag, [])
-            for f in fields:
-                table.insert("", tk.END, values=(f["tag"], f["name"], f["value"]))
-            if not fields:
-                table.insert(
-                    "",
-                    tk.END,
-                    values=("--", "--", "Data group not present on this document."),
-                )
 
         # --- data groups -----------------------------------------------
         self._clear_table(self.groups_table)
@@ -1266,7 +1343,7 @@ class EpassportGui:
         for err in pd.errors:
             self.log_cb(f"! {err}")
 
-        self.tabview.set("Passport (DG1)")
+        self.tabview.set("Passport")
 
     def _render_security(self, pd: PassportData) -> None:
         self.sec_text.config(state="normal")
