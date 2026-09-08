@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""eMRTD Passport Reader - a JMRTD-style GUI for reading ICAO e-passports.
+"""eMRTD Passport Reader - GUI for reading ICAO e-passports.
 
 The application connects to a PC/SC reader, authenticates with **BAC** or
 **PACE** (selectable in the toolbar), reads the Logical Data Structure
 (EF.COM, EF.SOD and the data groups) over secure messaging and displays the
-result in tabs, mirroring the layout of the well-known JMRTD (jmrtd) GUI:
+result in tabs:
 
 * Passport (DG1) - the decoded machine readable zone
 * Portrait (DG2) / Signature (DG7) - embedded images
@@ -76,7 +76,7 @@ FIELD_LABELS: Dict[str, str] = {
 class EpassportGui:
     def __init__(self, root: ctk.CTk):
         self.root = root
-        self.root.title("eMRTD Passport Reader (JMRTD-style)")
+        self.root.title("eMRTD Passport Reader")
         self.root.geometry("1180x760")
         self.root.minsize(980, 640)
 
@@ -1646,7 +1646,7 @@ class EpassportGui:
     def _about(self) -> None:
         messagebox.showinfo(
             "About",
-            "eMRTD Passport Reader (JMRTD-style)\n\n"
+            "eMRTD Passport Reader\n\n"
             "A Python GUI that reads ICAO Doc 9303 e-passports via PC/SC.\n"
             "ICAO standard flow: reads EF.CardAccess first to auto-detect\n"
             "supported protocols (PACE/BAC), then authenticates accordingly.\n"
