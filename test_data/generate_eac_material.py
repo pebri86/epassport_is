@@ -69,6 +69,12 @@ OID_ROLE_CVCA = bytes.fromhex("04007F00070202020201")  # id-RoleOfCVCA
 OID_ROLE_DV = bytes.fromhex("04007F00070202020202")    # id-RoleOfDV
 OID_ROLE_IS = bytes.fromhex("04007F00070202020203")    # id-RoleOfIS (terminal)
 
+# When set, certificates embed the full explicit brainpoolP256r1 domain
+# parameters (a complete / "real" CVC, ~410 B) so the SM PSO travels as an
+# extended-length APDU - for testing the extended receive path. When clear,
+# only the EC point is carried (~210 B, short-APDU friendly).
+_LARGE = False
+
 CVCA_CAR = b"UTSTCVCA00001"
 CVCA2_CAR = b"UTSTCVCA00002"
 DV_CHR = b"UTSDV00001"
@@ -112,12 +118,25 @@ def _point_from_key(key) -> bytes:
 def _cvc_body(
     car: bytes, chr_: bytes, subject_public_point: bytes, role_oid: bytes, role: int, rights: int
 ) -> bytes:
-    # Public key: only the EC point (tag 86). The applet verifies on its own
-    # configured brainpoolP256r1 domain (TrustStore / DomainParameterManager),
-    # so the certificate does not need to embed the explicit domain parameters
-    # (tags 81-85). Omitting them keeps each certificate ~210 bytes so the SM
-    # PSO:VERIFY command fits a short APDU.
-    pk = _tlv(0x7F49, _tlv(0x86, subject_public_point))
+    # The applet verifies on its own configured brainpoolP256r1 domain, so the
+    # certificate does not need to embed the domain parameters. By default only
+    # the EC point (86) is carried (~210 B, short-APDU friendly). With --large,
+    # embed the full explicit domain-parameters block (a complete, real CVC).
+    if _LARGE:
+        g = b"\x04" + _BP_GX + _BP_GY
+        pk = _tlv(
+            0x7F49,
+            _tlv(0x06, OID_EC_PUBLIC_KEY)
+            + _tlv(0x81, _BP_P)
+            + _tlv(0x82, _BP_A)
+            + _tlv(0x83, _BP_B)
+            + _tlv(0x84, g)
+            + _tlv(0x85, _BP_N)
+            + _tlv(0x86, subject_public_point)
+            + _tlv(0x87, b"\x01"),
+        )
+    else:
+        pk = _tlv(0x7F49, _tlv(0x86, subject_public_point))
     chat = _tlv(0x7F4C, _tlv(0x06, role_oid) + _tlv(0x53, bytes([role, rights])))
     return b"".join(
         (
@@ -196,6 +215,8 @@ def save_pem(key, path: str) -> None:
 
 
 def main() -> int:
+    global _LARGE
+
     here = os.path.dirname(os.path.abspath(__file__))
 
     parser = argparse.ArgumentParser(
@@ -206,9 +227,15 @@ def main() -> int:
         help="also generate the CVCA link-certificate (rotation) kit: CVCA2 + DV2 + terminal2",
     )
     parser.add_argument(
+        "--large", action="store_true",
+        help="embed full explicit domain parameters (a complete, ~410 B CVC) so the SM PSO is extended-length",
+    )
+    parser.add_argument(
         "--force", action="store_true", help="regenerate keys even if they exist"
     )
     args = parser.parse_args()
+
+    _LARGE = args.large
 
     # Reuse existing CVCA key when present so the card's trust point does not
     # have to change on every regeneration.
