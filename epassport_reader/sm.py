@@ -43,6 +43,13 @@ def _encode_lc(lc: int) -> bytes:
     return b"\x00" + lc.to_bytes(2, "big")
 
 
+# Largest plaintext block per command when an oversized command is split with
+# ISO 7816-4 command chaining. 200 B keeps the wrapped SM body (DO87 + DO8E,
+# block-padded) safely below the 255-byte short-APDU Lc limit for both the
+# 3DES (8-byte) and AES (16-byte) SM suites.
+_CHAIN_PLAINTEXT = 200
+
+
 def _command_body(apdu: bytes):
     """Split an SM-wrapped command into (header, lc_bytes, body).
 
@@ -92,6 +99,52 @@ class SecureMessagingSession:
         if self.protocol == "BAC":
             return self._wrap_bac(cla, ins, p1, p2, data, le)
         return self._wrap_pace(cla, ins, p1, p2, data, le)
+
+    def wrap_command_chained(
+        self,
+        cla: int,
+        ins: int,
+        p1: int,
+        p2: int,
+        data: bytes = b"",
+        le: Optional[int] = None,
+    ):
+        """Yield the SM APDU(s) carrying ``data`` via ISO 7816-4 chaining.
+
+        Intended for short-APDU-only cards: when the wrapped command would not
+        fit a single short APDU, the data field is split across several command
+        APDUs, the CLA chaining bit (0x10) being set on every block but the
+        last. Each block is an independent SM command (its own SSC increment
+        and MAC); the card reassembles the decrypted DO87 plaintexts and
+        processes the command on the final block. ``le`` is carried only on the
+        final block.
+
+        This is a generator on purpose: ``wrap_command`` advances the SSC at
+        wrap time, so each block must be wrapped only when it is about to be
+        sent. Eagerly wrapping the whole chain would pre-advance the SSC past
+        the still-unsent blocks and desynchronise the response unwrapping
+        (which uses ``SSC + 1``). Send each yielded APDU (and unwrap its
+        response) before asking for the next one.
+        """
+        if len(data) <= _CHAIN_PLAINTEXT:
+            yield self.wrap_command(cla, ins, p1, p2, data=data, le=le)
+            return
+
+        total = len(data)
+        off = 0
+        while off < total:
+            block = data[off : off + _CHAIN_PLAINTEXT]
+            off += len(block)
+            last = off >= total
+            block_cla = cla if last else (cla | 0x10)
+            yield self.wrap_command(
+                block_cla,
+                ins,
+                p1,
+                p2,
+                data=block,
+                le=le if last else None,
+            )
 
     def _wrap_bac(self, cla, ins, p1, p2, data, le) -> bytes:
         inc_ssc(self.ssc)

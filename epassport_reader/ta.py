@@ -91,6 +91,22 @@ def _ecdsa_sign_sha256(ec_key: ECPrivateKey, message: bytes) -> bytes:
     return _ecdsa_sign_plain(ec_key.d, ec_key.curve, message)
 
 
+def _unwrap_ok(
+    session: SecureMessagingSession, resp: bytes, sw: int, label: str
+) -> bytes:
+    plain, psw = session.unwrap_response(resp, sw)
+    if psw != 0x9000:
+        raise RuntimeError(f"{label} failed: SW={psw:04X}")
+    return plain
+
+
+def _send_protected(
+    session: SecureMessagingSession, send: SendFn, cmd: bytes, label: str
+) -> bytes:
+    resp, sw = send(cmd)
+    return _unwrap_ok(session, resp, sw, label)
+
+
 def do_terminal_authentication(
     session: SecureMessagingSession,
     send: SendFn,
@@ -123,11 +139,7 @@ def do_terminal_authentication(
         log = lambda _m: None
 
     def sm(cmd: bytes) -> bytes:
-        resp, sw = send(cmd)
-        plain, psw = session.unwrap_response(resp, sw)
-        if psw != 0x9000:
-            raise RuntimeError(f"TA command failed: SW={psw:04X}")
-        return plain
+        return _send_protected(session, send, cmd, "TA command")
 
     # 1. MSE Set DST: select the CVCA trust-point by CAR.
     data = b"\x83" + bytes([len(cvca_car)]) + cvca_car
@@ -136,12 +148,17 @@ def do_terminal_authentication(
     sm(cmd)
 
     # 2. PSO Verify Certificate: import the terminal certificate chain.
+    #
+    # The card is short-APDU-only (an extended-length command resets it), so a
+    # full-size (~430 B) CVC is sent with ISO 7816-4 command chaining: the
+    # chaining bit (CLA 0x10) is set on every block but the last and the card
+    # reassembles them before verifying.
     for cert in cert_chain:
-        cmd = session.wrap_command(
+        for cmd in session.wrap_command_chained(
             0x00, INS_PSO, PSO_VERIFY_CERT_P1, PSO_VERIFY_CERT_P2, data=cert
-        )
-        log(f"TA PSO verify cert -> {cmd.hex(' ').upper()}")
-        sm(cmd)
+        ):
+            log(f"TA PSO verify cert -> {cmd.hex(' ').upper()}")
+            sm(cmd)
 
     # 3. MSE Set AT: select the terminal public key by CHR.
     data = b"\x83" + bytes([len(terminal_chr)]) + terminal_chr
