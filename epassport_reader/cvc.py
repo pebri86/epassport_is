@@ -42,6 +42,8 @@ CHIP_AUTH_INFO_OID = bytes.fromhex("04007F00070202040202")
 # id-CA-ECDH-AES-CBC-CMAC-128 / -256 (ICAO Doc 9303-11) -> CA session key bits.
 CA_ECDH_CMAC_128 = bytes.fromhex("04007F00070202030202")
 CA_ECDH_CMAC_256 = bytes.fromhex("04007F00070202030204")
+# id-CA-ECDH-3DES-CBC-CBC (0.4.0.127.0.7.2.2.3.2.1): legacy 3DES CA suite (no AES bits).
+CA_ECDH_3DES = bytes.fromhex("04007F00070202030201")
 _CA_OID_TO_BITS = {CA_ECDH_CMAC_128: 128, CA_ECDH_CMAC_256: 256}
 
 # ---------------------------------------------------------------------------
@@ -149,16 +151,18 @@ _POINT_CANDIDATE_TAGS = (0x81, 0x86)
 # ChipAuthenticationPublicKeyInfo AlgorithmIdentifier may carry instead of an
 # INTEGER standardized-domain-parameter id -> ICAO parameter id (curve).
 _NAMED_CURVE_OID_TO_PARAM_ID = {
-    bytes.fromhex("2A8648CE3D030107"): 12,  # prime256v1 (NIST P-256)
+    bytes.fromhex("2A8648CE3D030101"): 12,  # prime256v1 (NIST P-256)
+    bytes.fromhex("2A8648CE3D030107"): 12,  # secp256r1 (NIST P-256)
     bytes.fromhex("2B2403030208010107"): 13,  # brainpoolP256r1
     bytes.fromhex("2B81040022"): 16,  # secp384r1 (NIST P-384)
     bytes.fromhex("2B81040023"): 17,  # secp521r1 (NIST P-521)
 }
 
-# ECDH Chip-Authentication key-agreement protocol OIDs (the id-CA-ECDH-AES-CBC-CMAC
-# family used to select the CA suite / AES key size in an MSE:Set AT).
+# ECDH Chip-Authentication key-agreement protocol OIDs (id-CA-ECDH-* family used
+# to select the CA suite - 3DES-CBC-CBC or AES-CBC-CMAC - in an MSE:Set AT).
 _CA_ECDH_AGREEMENT_OIDS = frozenset(
     {
+        bytes.fromhex("04007F00070202030201"),  # id-CA-ECDH-3DES-CBC-CBC
         bytes.fromhex("04007F00070202030202"),  # id-CA-ECDH-AES-CBC-CMAC-128
         bytes.fromhex("04007F00070202030204"),  # id-CA-ECDH-AES-CBC-CMAC-256
     }
@@ -172,12 +176,14 @@ class ChipAuthData(NamedTuple):
     public_key_ref: bytes  # keyId, used as the TA MSE DO83 reference
     parameter_id: Optional[int] = None  # standardized domain parameter id (curve)
     ca_key_bits: Optional[int] = None  # 128 or 256 (CA AES session key length)
+    ca_oid: Optional[bytes] = None  # CA key-agreement OID (3DES or AES suite)
 
 
 # Named-curve OIDs found in the CA SPKI AlgorithmIdentifier -> ICAO domain
 # parameter id (matches epassport_reader.pace.PARAM_ID_TO_EC).
 _NAMED_CURVE_OID_TO_PARAM = {
-    bytes.fromhex("2A8648CE3D030107"): 12,  # secp256r1 / prime256v1 (NIST P-256)
+    bytes.fromhex("2A8648CE3D030101"): 12,  # prime256v1 (NIST P-256)
+    bytes.fromhex("2A8648CE3D030107"): 12,  # secp256r1 (NIST P-256)
     bytes.fromhex("2B2403030208010107"): 13,  # brainpoolP256r1
     bytes.fromhex("2B81040022"): 16,  # secp384r1
     bytes.fromhex("2B81040023"): 17,  # secp521r1
@@ -344,6 +350,7 @@ def parse_chip_auth_data(raw: bytes) -> Optional[ChipAuthData]:
 
     key_data = None
     ca_bits = None
+    ca_oid = None
 
     for tag, value in parse_tlvs(raw):  # SecurityInfo SEQUENCEs
         if tag != TAG_SEQUENCE:
@@ -356,19 +363,29 @@ def parse_chip_auth_data(raw: bytes) -> Optional[ChipAuthData]:
             if inner_tag == TAG_SEQUENCE:
                 if ca_bits is None:
                     ca_bits = _ca_key_bits_of(inner_value)
+                if ca_oid is None:
+                    _oid, _kid = _ca_agreement_fields(inner_value)
+                    if _oid is not None:
+                        ca_oid = _oid
                 if key_data is None:
                     key_data = _parse_security_info(inner_value)
         if ca_bits is None:
             ca_bits = _ca_key_bits_of(value)
+        if ca_oid is None:
+            _oid, _kid = _ca_agreement_fields(value)
+            if _oid is not None:
+                ca_oid = _oid
         if key_data is None:
             key_data = _parse_security_info(value)
-        if key_data is not None and ca_bits is not None:
+        if key_data is not None and (ca_bits is not None or ca_oid is not None):
             break
 
     if key_data is None:
         return None
-    point, key_id, param_id, _protocol_oid = key_data
-    return ChipAuthData(point, key_id, param_id, ca_bits)
+    point, key_id, param_id, protocol_oid = key_data
+    if ca_oid is None:
+        ca_oid = protocol_oid
+    return ChipAuthData(point, key_id, param_id, ca_bits, ca_oid)
 
 
 def _extract_security_info(body: bytes) -> Dict[str, object]:

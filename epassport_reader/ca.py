@@ -44,13 +44,31 @@ MSE_CA_P1 = 0x41  # set for computation / CA selection
 MSE_CA_P2 = 0xA4  # authentication template
 GENERAL_AUTH_INS = 0x86
 
-# id-CA-ECDH-AES-CBC-CMAC-128 / -256 (ICAO Doc 9303-11 §6.2.4.2)
-CA_OID_CMAC_128 = bytes.fromhex("04007F00070202030202")
-CA_OID_CMAC_256 = bytes.fromhex("04007F00070202030204")
+# Chip-Authentication key-agreement OIDs (ICAO Doc 9303-11 / TR-03110).
+CA_OID_3DES = bytes.fromhex("04007F00070202030201")  # id-CA-ECDH-3DES-CBC-CBC
+CA_OID_CMAC_128 = bytes.fromhex("04007F00070202030202")  # id-CA-ECDH-AES-CBC-CMAC-128
+CA_OID_CMAC_256 = bytes.fromhex("04007F00070202030204")  # id-CA-ECDH-AES-CBC-CMAC-256
 
 
 def ca_mse_oid(key_bits: int) -> bytes:
     return CA_OID_CMAC_256 if key_bits == 256 else CA_OID_CMAC_128
+
+
+def ca_suite(ca_oid: Optional[bytes], key_bits: int) -> Tuple[bytes, str, int]:
+    """Resolve the CA suite -> ``(MSE OID, SM protocol, KDF key bits)``.
+
+    * ``id-CA-ECDH-3DES-CBC-CBC`` -> 3DES-CBC + retail MAC (``"BAC"`` SM, 8-byte
+      SSC); the session keys use the SHA-1 KDF truncated to 16 bytes.
+    * ``id-CA-ECDH-AES-CBC-CMAC-128/256`` -> AES-CBC + CMAC (``"PACE"`` SM,
+      16-byte SSC), SHA-1 or SHA-256 KDF respectively.
+    """
+    if ca_oid == CA_OID_3DES:
+        return CA_OID_3DES, "BAC", 128
+    if ca_oid == CA_OID_CMAC_256:
+        return CA_OID_CMAC_256, "PACE", 256
+    if ca_oid == CA_OID_CMAC_128:
+        return CA_OID_CMAC_128, "PACE", 128
+    return ca_mse_oid(key_bits), "PACE", key_bits
 
 
 class ChipAuthResult(NamedTuple):
@@ -93,8 +111,11 @@ def _do_ca_exchange(
     log: LogFn,
     curve: object = EC_P256,
     key_bits: int = 256,
+    ca_oid: Optional[bytes] = None,
 ) -> ChipAuthResult:
     """Run the ICAO-standard CA exchange against an established SM ``session``."""
+    mse_oid, sm_protocol, kdf_bits = ca_suite(ca_oid, key_bits)
+
     # 1. generate the terminal's ephemeral key pair on the chip's curve
     d_ifd = secrets.randbelow(curve.n - 1) + 1
     g = (curve.gx, curve.gy)
@@ -102,8 +123,7 @@ def _do_ca_exchange(
 
     # 2. MSE Set AT (0x41A4) selects the CA protocol, under SM
     ref = key_ref[:1] if key_ref else b"\x00"
-    ca_oid = ca_mse_oid(key_bits)
-    data = b"\x80" + bytes([len(ca_oid)]) + ca_oid + b"\x84\x01" + ref
+    data = b"\x80" + bytes([len(mse_oid)]) + mse_oid + b"\x84\x01" + ref
     cmd = session.wrap_command(0x00, MSE_SET_AT_INS, MSE_CA_P1, MSE_CA_P2, data=data)
     log(f"CA MSE Set AT (0x41A4) -> {cmd.hex(' ').upper()}")
     resp, sw = send(cmd)
@@ -112,9 +132,15 @@ def _do_ca_exchange(
     if psw != 0x9000:
         raise RuntimeError(f"Chip Authentication MSE Set AT failed: SW={psw:04X}")
 
-    # 3. GENERAL AUTHENTICATE with the terminal's ephemeral key, under SM
-    ga = b"\x7c" + bytes([2 + len(q_ifd)]) + b"\x86" + bytes([len(q_ifd)]) + q_ifd
-    cmd = session.wrap_command(0x00, GENERAL_AUTH_INS, 0x00, 0x00, data=ga)
+    # 3. GENERAL AUTHENTICATE carrying the terminal's ephemeral key, under SM.
+    # ICAO encodes the terminal's CA public key in DO 0x80 (7C { 80 <point> }).
+    # The command must stay SM-protected (a clear CLA=0x00 form is refused with
+    # 6800) and must carry DO97 (Le) for the CA response/token, or the chip
+    # answers 6987 "expected SM data objects missing".
+    ga = b"\x7c" + bytes([2 + len(q_ifd)]) + b"\x80" + bytes([len(q_ifd)]) + q_ifd
+    cmd = session.wrap_command(
+        0x00, GENERAL_AUTH_INS, 0x00, 0x00, data=ga, le=0x00
+    )
     log(f"CA GENERAL AUTHENTICATE -> {cmd.hex(' ').upper()}")
     resp, sw = send(cmd)
     plain, psw = session.unwrap_response(resp, sw)
@@ -131,20 +157,22 @@ def _do_ca_exchange(
         raise RuntimeError("Chip Authentication ECDH produced point at infinity")
     z = shared_point[0].to_bytes(curve.field_size, "big")
 
-    # 5. derive AES CA session keys and start a fresh PACE session (SSC = 0)
-    kenc, kmac = derive_ca_keys(z, key_bits)
+    # 5. derive CA session keys and start a fresh SM session (SSC = 0)
+    kenc, kmac = derive_ca_keys(z, kdf_bits)
     log(f"CA KSEnc(fp) ({len(kenc) * 8}-bit) = {fingerprint(kenc)}")
     log(f"CA KSMac(fp) ({len(kmac) * 8}-bit) = {fingerprint(kmac)}")
-    new_session = SecureMessagingSession("PACE", kenc, kmac, b"\x00" * 16)
+    ssc_len = 8 if sm_protocol == "BAC" else 16
+    new_session = SecureMessagingSession(sm_protocol, kenc, kmac, b"\x00" * ssc_len)
     # Preserve the IC's PACE ephemeral X (ID_IC for Terminal Authentication);
     # CA re-keys the channel but ID_IC is bound to the PACE session.
     if hasattr(session, "pace_icc_eph_x"):
         new_session.pace_icc_eph_x = session.pace_icc_eph_x
     # Evidence for the coverage report (fingerprints only).
     new_session.ca_evidence = {
-        "oid": oid_dotted(ca_mse_oid(key_bits)),
-        "oid_hex": ca_mse_oid(key_bits).hex(":").upper(),
-        "key_bits": key_bits,
+        "oid": oid_dotted(mse_oid),
+        "oid_hex": mse_oid.hex(":").upper(),
+        "key_bits": kdf_bits,
+        "sm": sm_protocol,
         "curve": curve.name,
         "key_id": ref[0] if ref else 0,
         "ifd_public_fp": fingerprint(q_ifd),
@@ -163,6 +191,7 @@ def do_chip_authentication(
     log: Optional[LogFn] = None,
     curve: object = EC_P256,
     key_bits: int = 256,
+    ca_oid: Optional[bytes] = None,
 ) -> ChipAuthResult:
     """Perform Chip Authentication over an established SM session.
 
@@ -173,8 +202,12 @@ def do_chip_authentication(
     (from EF.DG14) used in the MSE key-reference tag; empty defaults to 0.
     ``curve`` must match the chip's CA public key domain (from EF.DG14).
     ``key_bits`` (128 or 256) is the CA AES session-key size advertised by the
-    chip's ``id-CA-ECDH-AES-CBC-CMAC-*`` OID in EF.DG14.
+    chip's ``id-CA-ECDH-AES-CBC-CMAC-*`` OID in EF.DG14. ``ca_oid`` is the
+    chip's CA key-agreement OID (3DES or AES); when given it selects the suite
+    (the 3DES suite upgrades to a 3DES/retail-MAC SM session).
     """
     if log is None:
         log = lambda _m: None
-    return _do_ca_exchange(session, send, chip_public_key, key_ref, log, curve, key_bits)
+    return _do_ca_exchange(
+        session, send, chip_public_key, key_ref, log, curve, key_bits, ca_oid
+    )

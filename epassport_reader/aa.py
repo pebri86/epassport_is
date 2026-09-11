@@ -139,20 +139,43 @@ def do_active_authentication(
     if len(challenge) != CHALLENGE_LENGTH:
         raise ValueError("AA challenge must be 8 bytes")
 
-    cmd = (
-        bytes([0x00, INS_INTERNAL_AUTHENTICATE, 0x00, 0x00, CHALLENGE_LENGTH])
-        + challenge
-    )
-    log(f"AA INTERNAL_AUTHENTICATE -> {cmd.hex(' ').upper()}")
-    signature, sw = send(cmd)
+    def _plain():
+        # Le=0x00 is required so the chip may return the (up to 256-byte)
+        # signature; without it real chips answer SW=6700 (wrong length).
+        cmd = (
+            bytes([0x00, INS_INTERNAL_AUTHENTICATE, 0x00, 0x00, CHALLENGE_LENGTH])
+            + challenge
+            + b"\x00"
+        )
+        log(f"AA INTERNAL_AUTHENTICATE -> {cmd.hex(' ').upper()}")
+        return send(cmd)
+
+    def _over_sm():
+        cmd = session.wrap_command(
+            0x00, INS_INTERNAL_AUTHENTICATE, 0x00, 0x00, data=challenge, le=0x00
+        )
+        log(f"AA INTERNAL_AUTHENTICATE (SM) -> {cmd.hex(' ').upper()}")
+        resp, sw = send(cmd)
+        plain, psw = session.unwrap_response(resp, sw)
+        return plain, psw
+
+    # Real chips differ: some accept the clear INTERNAL_AUTHENTICATE, others
+    # require it SM-protected once the channel is established (pypassport wraps
+    # it).  Try plain first; on a security rejection retry over SM.  A plain
+    # command does not advance the SSC, so the retry stays in sync.
+    signature, sw = _plain()
     if sw != 0x9000:
-        if sw == 0x6982:
-            raise RuntimeError(
-                "INTERNAL_AUTHENTICATE rejected (6982): the document needs an "
-                "Active-Authentication key personalised (--aa-key) and the "
-                "session must be authenticated (BAC or PACE)."
-            )
-        raise RuntimeError(f"INTERNAL_AUTHENTICATE failed: SW={sw:04X}")
+        if sw in (0x6982, 0x6882, 0x6A81, 0x6700, 0x6800, 0x6A86):
+            log(f"AA plain INTERNAL_AUTHENTICATE rejected (SW={sw:04X}); retrying over SM")
+            signature, sw = _over_sm()
+        if sw != 0x9000:
+            if sw == 0x6982:
+                raise RuntimeError(
+                    "INTERNAL_AUTHENTICATE rejected (6982): the document needs an "
+                    "Active-Authentication key personalised (--aa-key) and the "
+                    "session must be authenticated (BAC or PACE)."
+                )
+            raise RuntimeError(f"INTERNAL_AUTHENTICATE failed: SW={sw:04X}")
     log(f"AA signature ({len(signature)} B) = {signature.hex(' ').upper()}")
 
     kind, key = aa_public_key

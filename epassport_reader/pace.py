@@ -365,11 +365,15 @@ def _build_mse_set_at(
     if param_id is not None:
         # DO84 = standardized domain parameter id (selects the curve)
         data += bytes([0x84, 0x01, param_id & 0xFF])
-    return bytes.fromhex("1022C1A4") + bytes([len(data)]) + data
+    # ICAO PACE MSE:Set AT is sent with CLA=0x00.  Real contact passports
+    # reject the CLA=0x10 form with SW=6985 (conditions of use not satisfied),
+    # even though lenient simulators accept it (cf. pypassport iso7816.mse_set_at).
+    return bytes.fromhex("0022C1A4") + bytes([len(data)]) + data
 
 
 MSE_SET_AT = _build_mse_set_at(PACE_OID)
-GET_ENCRYPTED_NONCE = bytes.fromhex("10860000027C00")
+# GA1 (GET ENCRYPTED NONCE): short APDU with Le=0x00 (the chip returns the nonce).
+GET_ENCRYPTED_NONCE = bytes.fromhex("10860000027C0000")
 
 
 def _auth_public_key(pub: bytes, pace_oid: Optional[bytes] = None) -> bytes:
@@ -446,7 +450,7 @@ def do_pace(
         + bytes([len(q_ifd_map_enc)])
         + q_ifd_map_enc
     )
-    data, sw = send(b"\x10\x86\x00\x00" + bytes([len(ga2)]) + ga2)
+    data, sw = send(b"\x10\x86\x00\x00" + bytes([len(ga2)]) + ga2 + b"\x00")
     if sw != 0x9000:
         raise RuntimeError(f"PACE step 2 (mapping) failed: SW={sw:04X}")
     # PACE-GM: the card responds with its mapping public key Y_icc = [y_icc]G (DO 0x82).
@@ -467,7 +471,7 @@ def do_pace(
         + bytes([len(q_ifd_enc)])
         + q_ifd_enc
     )
-    data, sw = send(b"\x10\x86\x00\x00" + bytes([len(ga3)]) + ga3)
+    data, sw = send(b"\x10\x86\x00\x00" + bytes([len(ga3)]) + ga3 + b"\x00")
     if sw != 0x9000:
         raise RuntimeError(f"PACE step 3 (ephemeral key) failed: SW={sw:04X}")
     q_icc = _ec_decode_point(_parse_7c(data, 0x84), ec)
@@ -491,7 +495,9 @@ def do_pace(
         + bytes([len(terminal_token)])
         + terminal_token
     )
-    data, sw = send(b"\x10\x86\x00\x00" + bytes([len(ga4)]) + ga4)
+    # The final GA (terminal token) is sent with CLA=0x00, mirroring pypassport's
+    # known-good sequence against real passports (GA1-GA3 use CLA=0x10).
+    data, sw = send(b"\x00\x86\x00\x00" + bytes([len(ga4)]) + ga4 + b"\x00")
     if sw != 0x9000:
         raise RuntimeError(f"PACE step 4 (terminal token) failed: SW={sw:04X}")
     card_token = _parse_7c(data, 0x86)

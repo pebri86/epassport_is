@@ -192,7 +192,22 @@ class EPassportReader:
                 password = build_mrz_info(self.doc_number, self.dob, self.expiry)
                 pw_ref = b"\x01"
                 self.log("PACE password: MRZ information")
-            self.session = do_pace(
+            self.session = self._run_pace(password, pw_ref)
+        self._capture_pace_evidence()
+
+    def _run_pace(self, password: bytes, pw_ref: bytes):
+        """Run PACE, choosing the DF context the chip expects for MSE:Set AT.
+
+        Real chips differ on which DF must be current when MSE:Set AT is sent.
+        pypassport - which reads the Indonesian passport - runs PACE with the
+        Master File current (it reads EF.CardAccess from the MF and only selects
+        the eMRTD AID afterwards).  Other chips expect the eMRTD application to
+        be selected.  We try the MF context first (mirroring pypassport) and
+        fall back to the eMRTD context if MSE itself is rejected.
+        """
+
+        def _pace():
+            return do_pace(
                 self.card.send,
                 password,
                 self.log,
@@ -200,7 +215,50 @@ class EPassportReader:
                 pw_ref=pw_ref,
                 curve=self.pace_curve,
             )
-        self._capture_pace_evidence()
+
+        if self._select_mf_plain():
+            try:
+                session = _pace()
+            except RuntimeError as exc:
+                # Only fall back when MSE:Set AT was rejected; a later failure
+                # has already moved the chip into a GA state and must surface.
+                if "MSE:Set AT" not in str(exc):
+                    self._restore_emrtd_context()
+                    raise
+                self.log(f"PACE with MF current failed ({exc}); retrying on eMRTD DF")
+            else:
+                self.session = session
+                self._select_emrtd_sm()
+                return session
+
+        self._restore_emrtd_context()
+        self.session = _pace()
+        self._select_emrtd_sm()
+        return self.session
+
+    def _select_emrtd_sm(self) -> None:
+        """Select the eMRTD application over secure messaging.
+
+        After PACE (and BAC) the chip expects every command - including the
+        eMRTD AID selection - to be SM-protected.  A plaintext SELECT drops the
+        secure state and later SM commands are rejected (SW=6882); pypassport
+        routes this select through its SM layer for exactly this reason.
+        """
+        sm = self._sm()
+        sel = sm.wrap_command(0x00, 0xA4, 0x04, 0x0C, data=EMRTD_AID)
+        data, sw = self.card.send(sel)
+        if sw != 0x9000:
+            self.log(f"WARNING: SELECT eMRTD over SM SW={sw:04X}")
+            return
+        try:
+            _fci, psw = sm.unwrap_response(data, sw)
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"WARNING: SELECT eMRTD over SM unprotect failed: {exc}")
+            return
+        if psw == 0x9000:
+            self.log("eMRTD application re-selected (over SM)")
+        else:
+            self.log(f"WARNING: SELECT eMRTD over SM returned {psw:04X}")
 
     def _capture_pace_evidence(self) -> None:
         """Record PACE crypto evidence (fingerprints) from the SM session."""
@@ -292,6 +350,7 @@ class EPassportReader:
             self.log,
             curve,
             key_bits,
+            ca_data.ca_oid,
         )
         self.session = result.session
         self._ca_ifd_public = result.ifd_public
@@ -428,13 +487,13 @@ class EPassportReader:
         for cmd in mf_cmds:
             apdu = sm.wrap_command(*cmd[:4], data=cmd[4])
             data, sw = self.card.send(apdu)
-            if sw == 0x9000:
-                _, psw = sm.unwrap_response(data, sw)
-                if psw == 0x9000:
-                    return
-                self.log(f"SELECT MF P2={cmd[3]:02X} returned {psw:04X}")
-            else:
-                self.log(f"SELECT MF P2={cmd[3]:02X} failed: SW={sw:04X}")
+            # Unwrap regardless of the transport SW: some chips return the SM
+            # envelope together with an error status, and skipping the unwrap
+            # would leave the channel's SSC out of step.
+            _, psw = sm.unwrap_response(data, sw)
+            if psw == 0x9000:
+                return
+            self.log(f"SELECT MF P2={cmd[3]:02X} returned {psw:04X}")
         raise RuntimeError("SELECT MF failed with both P2=0x0C and P2=0x00")
 
     def _restore_lds1_context(self) -> None:
@@ -454,9 +513,6 @@ class EPassportReader:
             try:
                 sel = sm.wrap_command(0x00, 0xA4, 0x04, p2, data=EMRTD_AID)
                 data, sw = self.card.send(sel)
-                if sw != 0x9000:
-                    self.log(f"restore LDS1 (SM P2={p2:02X}) failed: SW={sw:04X}")
-                    continue
                 _, psw = sm.unwrap_response(data, sw)
                 if psw == 0x9000:
                     return
@@ -650,6 +706,20 @@ class EPassportReader:
         self.log(f"EF.CardAccess: {len(raw)} bytes (pre-auth)")
         return raw
 
+    def _select_mf_plain(self) -> bool:
+        """SELECT the Master File without secure messaging (pre-auth PACE).
+
+        Some chips (e.g. the Indonesian passport) reject MSE:Set AT with
+        SW=6982 when the eMRTD application is the current DF.  pypassport
+        reads EF.CardAccess from the MF, runs PACE, and only then selects the
+        eMRTD AID.  Returns True if the MF was selected.
+        """
+        for cmd in ("00A4000C023F00", "00A40000023F00"):
+            _data, sw = self.card.send(bytes.fromhex(cmd))
+            if sw == 0x9000:
+                return True
+        return False
+
     def _restore_emrtd_context(self) -> None:
         """Re-select the eMRTD application after an MF-level access.
 
@@ -714,69 +784,67 @@ class EPassportReader:
         if mf:
             self._select_mf()
 
-        fid_bytes = fid.to_bytes(2, "big")
+        try:
+            fid_bytes = fid.to_bytes(2, "big")
 
-        # SELECT EF (over SM).  After _select_mf() the current DF is MF, so
-        # use P2=0x00 (select by FID from current DF) rather than P2=0x0C
-        # (select by path from MF).
-        p2 = 0x00 if mf else 0x0C
-        sel = sm.wrap_command(0x00, 0xA4, 0x00, p2, data=fid_bytes)
-        data, sw = self.card.send(sel)
-        if sw != 0x9000:
-            raise RuntimeError(f"SELECT EF {fid:04X} failed: SW={sw:04X}")
-        fci, psw = sm.unwrap_response(data, sw)
-        if psw in (0x6A82, 0x6A88, 0x6282):
-            raise FileNotFoundError(f"EF {fid:04X} not found ({psw:04X})")
-        if psw != 0x9000:
-            raise RuntimeError(f"SELECT EF {fid:04X} returned {psw:04X}")
-
-        size = parse_fci_size(fci)  # real passports may provide this
-
-        buf = bytearray()
-        offset = 0
-        guard = 0
-        while True:
-            if size is not None and offset >= size:
-                break
-            le = READ_CHUNK
-            if size is not None:
-                le = min(le, size - offset)
-            if le <= 0:
-                break
-
-            cmd = sm.wrap_command(
-                0x00, 0xB0, (offset >> 8) & 0xFF, offset & 0xFF, le=le
-            )
-            data, sw = self.card.send(cmd)
-            if sw != 0x9000:
-                raise RuntimeError(f"READ BINARY EF {fid:04X} @{offset}: SW={sw:04X}")
-            chunk, psw = sm.unwrap_response(data, sw)
-            if psw in EOF_SW:
-                break  # end of file
+            # SELECT EF (over SM).  After _select_mf() the current DF is MF, so
+            # use P2=0x00 (select by FID from current DF) rather than P2=0x0C
+            # (select by path from MF).
+            p2 = 0x00 if mf else 0x0C
+            sel = sm.wrap_command(0x00, 0xA4, 0x00, p2, data=fid_bytes)
+            data, sw = self.card.send(sel)
+            fci, psw = sm.unwrap_response(data, sw)
+            if psw in (0x6A82, 0x6A88, 0x6282):
+                raise FileNotFoundError(f"EF {fid:04X} not found ({psw:04X})")
             if psw != 0x9000:
-                raise RuntimeError(
-                    f"READ BINARY EF {fid:04X} @{offset} returned {psw:04X}"
+                raise RuntimeError(f"SELECT EF {fid:04X} failed: SW={psw:04X}")
+
+            size = parse_fci_size(fci)  # real passports may provide this
+
+            buf = bytearray()
+            offset = 0
+            guard = 0
+            while True:
+                if size is not None and offset >= size:
+                    break
+                le = READ_CHUNK
+                if size is not None:
+                    le = min(le, size - offset)
+                if le <= 0:
+                    break
+
+                cmd = sm.wrap_command(
+                    0x00, 0xB0, (offset >> 8) & 0xFF, offset & 0xFF, le=le
                 )
-            if not chunk:
-                break  # applet returns 0 bytes at EOF
-            buf.extend(chunk)
-            offset += len(chunk)
+                data, sw = self.card.send(cmd)
+                chunk, psw = sm.unwrap_response(data, sw)
+                if psw in EOF_SW:
+                    break  # end of file (real chips may report 6B00 past EOF)
+                if psw != 0x9000:
+                    raise RuntimeError(
+                        f"READ BINARY EF {fid:04X} @{offset} returned {psw:04X}"
+                    )
+                if not chunk:
+                    break  # applet returns 0 bytes at EOF
+                buf.extend(chunk)
+                offset += len(chunk)
 
-            guard += 1
-            if guard > 4096 or offset > 128 * 1024:
-                raise RuntimeError(f"EF {fid:04X} read did not terminate")
+                guard += 1
+                if guard > 4096 or offset > 128 * 1024:
+                    raise RuntimeError(f"EF {fid:04X} read did not terminate")
 
-        # EF.SOD (0x011D) and EF.CardSecurity (0x011D) share the FID and are
-        # resolved by the current DF context. Restore the LDS1 (app-DF)
-        # context after an MF-level read so a later read_ef(0x011D, mf=False)
-        # targets EF.SOD again.
-        if mf:
-            self._restore_lds1_context()
+            phase = "post" if self._eac_ta_done else "pre"
+            self._ef_success[phase].add(fid)
 
-        phase = "post" if self._eac_ta_done else "pre"
-        self._ef_success[phase].add(fid)
-
-        return bytes(buf)
+            return bytes(buf)
+        finally:
+            # EF.SOD (0x011D) and EF.CardSecurity (0x011D) share the FID and are
+            # resolved by the current DF context. Restore the LDS1 (app-DF)
+            # context after an MF-level read - including a failed one - so later
+            # app-DF reads (EF.CVCA, EF.DG15 for AA, EF.DG14 for CA, DG3/DG4)
+            # still target the eMRTD application.
+            if mf:
+                self._restore_lds1_context()
 
     # ------------------------------------------------------------------
     # full read

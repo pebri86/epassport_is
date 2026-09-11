@@ -176,10 +176,10 @@ class SecureMessagingSession:
         body.extend(do8e)
 
         apdu = header + _encode_lc(len(body)) + bytes(body)
-        # Transport Le: only when the command specifies a logical Le (e.g.
-        # READ BINARY).  SELECT (le=None) carries no trailing Le byte.
-        if le is not None:
-            apdu += b"\x00"
+        # SM responses always carry a protected envelope (DO87/DO99/DO8E), so
+        # the command must be a case-4 APDU with a transport Le=0x00.  Real
+        # chips answer SW=6882 when Le is missing (cf. pypassport's SM classes).
+        apdu += b"\x00"
         return apdu
 
     def _wrap_pace(self, cla, ins, p1, p2, data, le) -> bytes:
@@ -202,7 +202,9 @@ class SecureMessagingSession:
         mac_input = pad80(bytes(self.ssc) + padded_header + bytes(body), 16)
         body.extend(tlv(0x8E, cmac8(self.kmac, mac_input)))
 
-        return header + _encode_lc(len(body)) + bytes(body)
+        # Transport Le=0x00: the PACE SM response is always a case-4 envelope
+        # (DO87/DO99/DO8E); real chips answer SW=6882 without it.
+        return header + _encode_lc(len(body)) + bytes(body) + b"\x00"
 
     # ------------------------------------------------------------------
     # command unwrapping (card side)
@@ -335,6 +337,10 @@ class SecureMessagingSession:
         return self._unwrap_pace(response, transport_sw)
 
     def _unwrap_bac(self, response, transport_sw) -> Tuple[bytes, int]:
+        # A response with no SM data objects is a bare transport error: nothing
+        # to verify and no response-side SSC step (keeps the channel in sync).
+        if not response or response[0] not in (0x87, 0x99, 0x8E):
+            return b"", transport_sw
         before_mac = bytearray()
         do87 = None
         do99 = None
@@ -372,6 +378,12 @@ class SecureMessagingSession:
         return plain, status
 
     def _unwrap_pace(self, response, transport_sw) -> Tuple[bytes, int]:
+        # A response with no SM data objects is a bare transport error: nothing
+        # to verify and no response-side SSC step (keeps the channel in sync).
+        # Real chips can also return an SM envelope (DO99) with an error status;
+        # that case falls through and advances the SSC normally.
+        if not response or response[0] not in (0x87, 0x99, 0x8E):
+            return b"", transport_sw
         before_mac = bytearray()
         do87 = None
         do99 = None
