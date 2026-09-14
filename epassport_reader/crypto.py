@@ -182,6 +182,8 @@ def build_mrz_info(doc_number: str, dob: str, expiry: str) -> bytes:
     doc = doc_number.upper().replace(" ", "<")
     if len(doc) == 9:
         doc += str(check_digit(doc))
+    elif len(doc) < 9:
+        doc += "<" * (9 - len(doc)) + str(check_digit(doc))
     elif len(doc) != 10:
         raise ValueError(
             "document number must be 9 or 10 characters (check digit optional)"
