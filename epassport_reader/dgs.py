@@ -40,6 +40,14 @@ def _unwrap_outer(data: bytes, expected_tag: int) -> bytes:
         try:
             tag, start, end = read_der_tlv(data, 0)
             if tag == expected_tag:
+                if end < len(data):
+                    # Some chips under-report the outer length, which would
+                    # truncate the last child TLV. Fall back to the full buffer
+                    # when the declared slice is not self-consistent.
+                    try:
+                        parse_tlvs(data[start:end])
+                    except ValueError:
+                        return data[start:]
                 return data[start:end]
         except ValueError:
             pass
@@ -160,7 +168,7 @@ def parse_mrz(lines: str) -> Dict[str, str]:
     sex = line2[20]
     expiry = line2[21:27]
     expiry_ck = line2[27]
-    personal_number = line2[28:43].replace("<", "")
+    personal_number = line2[28:42].replace("<", "")
     composite_ck = line2[43]
 
     return {

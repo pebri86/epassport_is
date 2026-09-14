@@ -903,11 +903,6 @@ class EPassportReader:
                 f"EF.SOD: {len(sod_raw)} bytes, "
                 f"{len(pd.sod_info.get('dg_hashes', {}))} DG hashes"
             )
-            # DEBUG: dump first bytes to log
-            self.log(f"SOD first 200: {sod_raw[:200].hex()}")
-            # DEBUG: save raw SOD for inspection
-            with open("/tmp/sod.raw", "wb") as f:
-                f.write(sod_raw)
         except Exception as exc:  # noqa: BLE001
             pd.errors.append(f"EF.SOD: {exc}")
             self.log(f"! EF.SOD read failed: {exc}")
@@ -925,8 +920,6 @@ class EPassportReader:
                 f"EF.CardSecurity: {len(cs_raw)} bytes, "
                 f"{len(pd.card_security_info['infos'])} SecurityInfos"
             )
-            with open("/tmp/cardsecurity.raw", "wb") as f:
-                f.write(cs_raw)
         except FileNotFoundError:
             pd.errors.append("EF.CardSecurity not found on card")
             self.log("! EF.CardSecurity not found")
