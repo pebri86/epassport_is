@@ -165,7 +165,7 @@ def do_active_authentication(
     # command does not advance the SSC, so the retry stays in sync.
     signature, sw = _plain()
     if sw != 0x9000:
-        if sw in (0x6982, 0x6882, 0x6A81, 0x6700, 0x6800, 0x6A86):
+        if sw in (0x6982, 0x6882, 0x6A81, 0x6700, 0x6800, 0x6A86, 0x6985):
             log(f"AA plain INTERNAL_AUTHENTICATE rejected (SW={sw:04X}); retrying over SM")
             signature, sw = _over_sm()
         if sw != 0x9000:
