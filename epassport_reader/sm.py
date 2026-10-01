@@ -43,6 +43,25 @@ def _encode_lc(lc: int) -> bytes:
     return b"\x00" + lc.to_bytes(2, "big")
 
 
+def _frame_apdu(header: bytes, body: bytes, extended: bool = False) -> bytes:
+    """Frame an SM body as a case-4 APDU.
+
+    ``extended=False`` uses the shortest Lc (short when it fits, extended
+    otherwise) and a 1-byte transport Le.  ``extended=True`` always uses the
+    ISO 7816-4 extended-length form (``00 || Lc(2) || body || Le(2)``,
+    Le=0x0000) so a large command is carried in a single extended APDU.
+    """
+    if extended:
+        return (
+            header
+            + b"\x00"
+            + len(body).to_bytes(2, "big")
+            + bytes(body)
+            + b"\x00\x00"
+        )
+    return header + _encode_lc(len(body)) + bytes(body) + b"\x00"
+
+
 # Largest plaintext block per command when an oversized command is split with
 # ISO 7816-4 command chaining. 200 B keeps the wrapped SM body (DO87 + DO8E,
 # block-padded) safely below the 255-byte short-APDU Lc limit for both the
@@ -95,10 +114,11 @@ class SecureMessagingSession:
         p2: int,
         data: bytes = b"",
         le: Optional[int] = None,
+        extended: bool = False,
     ) -> bytes:
         if self.protocol == "BAC":
-            return self._wrap_bac(cla, ins, p1, p2, data, le)
-        return self._wrap_pace(cla, ins, p1, p2, data, le)
+            return self._wrap_bac(cla, ins, p1, p2, data, le, extended)
+        return self._wrap_pace(cla, ins, p1, p2, data, le, extended)
 
     def wrap_command_chained(
         self,
@@ -146,7 +166,7 @@ class SecureMessagingSession:
                 le=le if last else None,
             )
 
-    def _wrap_bac(self, cla, ins, p1, p2, data, le) -> bytes:
+    def _wrap_bac(self, cla, ins, p1, p2, data, le, extended=False) -> bytes:
         inc_ssc(self.ssc)
         header = bytes([cla | 0x0C, ins, p1, p2])
         padded_header = header + b"\x80\x00\x00\x00"
@@ -175,14 +195,12 @@ class SecureMessagingSession:
         do8e = tlv(0x8E, mac)
         body.extend(do8e)
 
-        apdu = header + _encode_lc(len(body)) + bytes(body)
         # SM responses always carry a protected envelope (DO87/DO99/DO8E), so
-        # the command must be a case-4 APDU with a transport Le=0x00.  Real
-        # chips answer SW=6882 when Le is missing (cf. pypassport's SM classes).
-        apdu += b"\x00"
-        return apdu
+        # the command must be a case-4 APDU with a transport Le.  Real chips
+        # answer SW=6882 when Le is missing (cf. pypassport's SM classes).
+        return _frame_apdu(header, bytes(body), extended)
 
-    def _wrap_pace(self, cla, ins, p1, p2, data, le) -> bytes:
+    def _wrap_pace(self, cla, ins, p1, p2, data, le, extended=False) -> bytes:
         inc_ssc(self.ssc)
         header = bytes([cla | 0x0C, ins, p1, p2])
         body = bytearray()
@@ -202,9 +220,9 @@ class SecureMessagingSession:
         mac_input = pad80(bytes(self.ssc) + padded_header + bytes(body), 16)
         body.extend(tlv(0x8E, cmac8(self.kmac, mac_input)))
 
-        # Transport Le=0x00: the PACE SM response is always a case-4 envelope
+        # Transport Le: the PACE SM response is always a case-4 envelope
         # (DO87/DO99/DO8E); real chips answer SW=6882 without it.
-        return header + _encode_lc(len(body)) + bytes(body) + b"\x00"
+        return _frame_apdu(header, bytes(body), extended)
 
     # ------------------------------------------------------------------
     # command unwrapping (card side)

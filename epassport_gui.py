@@ -208,6 +208,18 @@ class EpassportGui:
         self.protocol_combo.set("Auto-detect (ICAO)")
         self.protocol_combo.pack(side="left", padx=(0, 12))
 
+        ctk.CTkLabel(bar, text="TA APDU:", font=ui_font).pack(side="left", padx=(4, 4))
+        self.ta_apdu_combo = ctk.CTkComboBox(
+            bar,
+            values=["Command chaining", "Extended APDU"],
+            width=150,
+            state="readonly",
+            command=lambda _v: None,
+            font=ui_font,
+        )
+        self.ta_apdu_combo.set("Command chaining")
+        self.ta_apdu_combo.pack(side="left", padx=(0, 12))
+
         ctk.CTkCheckBox(
             bar, text="Use CAN (PACE-CAN)", variable=self.use_can_var, font=ui_font
         ).pack(side="left", padx=(0, 12))
@@ -682,7 +694,16 @@ class EpassportGui:
 
         threading.Thread(
             target=self._read_worker,
-            args=(reader_idx, protocol, doc, dob, expiry, can, protocol_display),
+            args=(
+                reader_idx,
+                protocol,
+                doc,
+                dob,
+                expiry,
+                can,
+                protocol_display,
+                self._selected_ta_apdu_mode(),
+            ),
             daemon=True,
         ).start()
 
@@ -708,7 +729,8 @@ class EpassportGui:
         self._ta_done = False
 
     def _read_worker(
-        self, reader_idx, protocol, doc, dob, expiry, can, protocol_display
+        self, reader_idx, protocol, doc, dob, expiry, can, protocol_display,
+        ta_apdu_mode="chaining",
     ) -> None:
         try:
             # Connect and detect protocol first (ICAO standard)
@@ -798,6 +820,7 @@ class EpassportGui:
                 expiry=expiry,
                 can=can,
                 log=self.log_cb,
+                ta_apdu_mode=ta_apdu_mode,
             )
             reader.card = probe.card
             reader.atr = probe.atr
@@ -925,6 +948,10 @@ class EpassportGui:
         finally:
             self.root.after(0, self._set_buttons_busy, False)
 
+    def _selected_ta_apdu_mode(self) -> str:
+        """Map the toolbar TA APDU choice to a reader mode flag."""
+        return "extended" if self.ta_apdu_combo.get() == "Extended APDU" else "chaining"
+
     def do_terminal_auth(self) -> None:
         if self._reader is None:
             messagebox.showwarning(
@@ -952,6 +979,8 @@ class EpassportGui:
         )
         if not key_path:
             return
+        self._reader.ta_apdu_mode = self._selected_ta_apdu_mode()
+        self._log(f"TA APDU transport: {self.ta_apdu_combo.get()}")
         self._set_buttons_busy(True)
         self._set_status("Running Terminal Authentication (EAC step 2) ...")
         self._log("--- Starting Terminal Authentication (EAC TA) ---")

@@ -113,15 +113,25 @@ class EPassportReader:
         expiry: str = "",
         can: Optional[str] = None,
         log: Optional[LogFn] = None,
+        ta_apdu_mode: str = "chaining",
     ):
         self.protocol = protocol.upper()
         if self.protocol not in ("BAC", "PACE", "HYBRID"):
             raise ValueError(f"protocol must be BAC, PACE or HYBRID, got {protocol!r}")
+        if ta_apdu_mode not in ("chaining", "extended"):
+            raise ValueError(
+                "ta_apdu_mode must be 'chaining' or 'extended', "
+                f"got {ta_apdu_mode!r}"
+            )
         self.doc_number = doc_number
         self.dob = dob
         self.expiry = expiry
         self.can = can
         self.log = log or (lambda _m: None)
+        # How Terminal Authentication carries the oversized PSO Verify
+        # Certificate command: "chaining" (ISO 7816-4, default) or "extended"
+        # (single extended-length APDU).
+        self.ta_apdu_mode = ta_apdu_mode
         self.session: Optional[SecureMessagingSession] = None
         self.card: Optional[CardAdapter] = None
         self.atr: Optional[bytes] = None
@@ -415,6 +425,7 @@ class EPassportReader:
             id_ic,
             x_icc,
             self.log,
+            apdu_mode=self.ta_apdu_mode,
         )
         self._eac_ta_done = True
 

@@ -117,6 +117,7 @@ def do_terminal_authentication(
     id_ic: bytes,
     ca_x_icc: bytes,
     log: Optional[LogFn] = None,
+    apdu_mode: str = "chaining",
 ) -> None:
     """Run Terminal Authentication over the CA SM ``session``.
 
@@ -134,9 +135,17 @@ def do_terminal_authentication(
         id_ic: the ``ID_IC`` bytes (IC's PACE ephemeral X or MRZ document number).
         ca_x_icc: ``Comp(PKDH,IFD)`` - the X-coordinate of the terminal's CA
             ephemeral public key.
+        apdu_mode: how an oversized command (the PSO Verify Certificate CVC) is
+            carried. ``"chaining"`` (default) splits it across several short
+            APDUs with the ISO 7816-4 chaining bit (CLA 0x10); ``"extended"``
+            sends it as one extended-length APDU (``00 || Lc(2) || data``).
     """
     if log is None:
         log = lambda _m: None
+    if apdu_mode not in ("chaining", "extended"):
+        raise ValueError(
+            f"apdu_mode must be 'chaining' or 'extended', got {apdu_mode!r}"
+        )
 
     def sm(cmd: bytes) -> bytes:
         return _send_protected(session, send, cmd, "TA command")
@@ -149,16 +158,31 @@ def do_terminal_authentication(
 
     # 2. PSO Verify Certificate: import the terminal certificate chain.
     #
-    # The card is short-APDU-only (an extended-length command resets it), so a
-    # full-size (~430 B) CVC is sent with ISO 7816-4 command chaining: the
-    # chaining bit (CLA 0x10) is set on every block but the last and the card
-    # reassembles them before verifying.
+    # A full-size CVC is ~430 B, larger than a short APDU can carry, and cards
+    # differ in how they accept it.  Two transports are selectable:
+    #   * "chaining"  - ISO 7816-4 command chaining: the chaining bit (CLA 0x10)
+    #     is set on every block but the last and the card reassembles them
+    #     before verifying.  Required by short-APDU-only chips.
+    #   * "extended"  - one extended-length APDU (00 || Lc(2) || data || Le(2)).
+    #     Works on chips that support extended APDUs but reject chaining.
     for cert in cert_chain:
-        for cmd in session.wrap_command_chained(
-            0x00, INS_PSO, PSO_VERIFY_CERT_P1, PSO_VERIFY_CERT_P2, data=cert
-        ):
-            log(f"TA PSO verify cert -> {cmd.hex(' ').upper()}")
+        if apdu_mode == "extended":
+            cmd = session.wrap_command(
+                0x00,
+                INS_PSO,
+                PSO_VERIFY_CERT_P1,
+                PSO_VERIFY_CERT_P2,
+                data=cert,
+                extended=True,
+            )
+            log(f"TA PSO verify cert (extended APDU) -> {cmd.hex(' ').upper()}")
             sm(cmd)
+        else:
+            for cmd in session.wrap_command_chained(
+                0x00, INS_PSO, PSO_VERIFY_CERT_P1, PSO_VERIFY_CERT_P2, data=cert
+            ):
+                log(f"TA PSO verify cert (chained) -> {cmd.hex(' ').upper()}")
+                sm(cmd)
 
     # 3. MSE Set AT: select the terminal public key by CHR.
     data = b"\x83" + bytes([len(terminal_chr)]) + terminal_chr
